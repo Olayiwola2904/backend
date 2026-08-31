@@ -40,16 +40,25 @@ Use Jest with ts-jest for all testing.
 ```typescript
 // jest.config.ts
 export default {
-  preset: "ts-jest",
+  transform: {
+    "^.+\\.tsx?$": ["ts-jest", { tsconfig: "tsconfig.test.json" }],
+  },
   testEnvironment: "node",
   testMatch: ["**/__tests__/**/*.test.ts"],
   clearMocks: true,
   collectCoverageFrom: ["src/**/*.ts", "!src/**/__tests__/**"],
-  coverageThresholds: {
+  coverageDirectory: "coverage",
+  coverageReporters: ["text", "text-summary", "lcov", "json-summary"],
+  coverageThreshold: {
     global: { branches: 50, functions: 50, lines: 50, statements: 50 },
   },
 };
 ```
+
+> **Note:** The explicit `transform` entry (instead of `preset: "ts-jest"`) is required to pass
+> `tsconfig: "tsconfig.test.json"` — this isolates Jest's type-checking from the production
+> `tsconfig.json` (fix for #226). `coverageThreshold` is singular; Jest silently ignores the
+> misspelled `coverageThresholds` key, so the coverage gate would never enforce.
 
 ## Consequences
 
