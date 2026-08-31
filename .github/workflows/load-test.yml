@@ -46,8 +46,14 @@ jobs:
 
       - name: Run k6 load test
         env:
-          BASE_URL: ${{ github.event.inputs.base_url || 'http://localhost:3001' }}
+          BASE_URL: ${{ github.event.inputs.base_url || vars.STAGING_BASE_URL || 'http://localhost:3001' }}
         run: |
+          # On schedule, github.event.inputs is empty; vars.STAGING_BASE_URL provides the real
+          # staging target so the nightly smoke test does not silently fall back to a dead localhost.
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -z "${{ vars.STAGING_BASE_URL }}" ]; then
+            echo "::warning::STAGING_BASE_URL repository variable is not set — nightly scheduled run will target localhost:3001 and likely fail with connection errors. Set vars.STAGING_BASE_URL to your staging URL."
+          fi
+          echo "Target BASE_URL=${BASE_URL} (event=${{ github.event_name }})"
           mkdir -p load-tests/reports
           k6 run \
             --env BASE_URL="${BASE_URL}" \
