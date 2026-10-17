@@ -34,8 +34,8 @@ import { TIP_VISIBLE_STATE } from '../moderation/moderation.types';
 import { TipFilterInput, buildTipWhere, describeTipFilters } from './tip-filters';
 import { invalidateCaches, tipCacheKeys } from '../../lib/cache/invalidation';
 import { withJobTracePayload } from '../../lib/requestContext';
-
 /**
+
  * Columns required to build a TipResponse.
  * Media columns selected alongside a tip. Only `ready` media is exposed: rows
  * still scanning, rejected, or failed are invisible to tip readers.
@@ -104,7 +104,7 @@ class OptimisticLockError extends Error {
 }
 
 export class PaymentService extends BaseService {
-  private transactionService: TransactionService;
+  private readonly transactionService: TransactionService;
 
   constructor(private prisma: PrismaClient) {
     super();
@@ -860,11 +860,6 @@ export class PaymentService extends BaseService {
   /**
    * Update tip status (typically used by transaction listener/confirmation service)
    * Can only update to specific statuses based on current state
-   *
-   * Transaction pattern: all state mutations (status transition, optimistic
-   * lock, creator earnings credit) execute inside a single
-   * `transactionService.updateTipStatus` callback transaction. Side effects
-   * (referral commission, webhooks) run after commit and are idempotent.
    */
   async updateTipStatus(tipId: string, data: UpdateTipStatusRequest): Promise<TipResponse> {
     return this.executeWithLogging('payment.updateTipStatus', async () => {
@@ -875,7 +870,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactionService.updateTipStatus(tipId, data.status, async (tx) => {
+          finalTip = await this.transactionService.updateTipStatus(tipId, data, async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -1153,7 +1148,7 @@ export class PaymentService extends BaseService {
       }
 
       try {
-        const updatedTip = await this.transactionService.updateTipTransactionHash({
+        const updatedTip = await this.transactionService.recordTransactionHash({
           where: { id: tipId },
           data: {
             transactionHash: result.transactionHash,
@@ -1327,11 +1322,11 @@ export class PaymentService extends BaseService {
         }
 
         if (outcome === 'success') {
-          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
+          return this.transactionService.confirmTip(tipId, TipStatus.COMPLETED, (id, data) => this.updateTipStatus(id, data));
         }
 
         if (outcome === 'failed') {
-          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
+          return this.transactionService.confirmTip(tipId, TipStatus.FAILED, (id, data) => this.updateTipStatus(id, data));
         }
 
         // Still pending: back off and poll again.
