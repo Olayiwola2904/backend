@@ -3,8 +3,6 @@ import { JobEventBus, createJobEvent, jobEvents as defaultEvents } from './event
 import { recordJobEnqueued, setDeadLetterCount, updateQueueDepth } from './metrics';
 import { JobSchedule, scheduleJob } from './scheduler';
 import { EnqueueOptions, JobQueue, JobRecord, QueueCounts } from './types';
-import type { TransactionService } from '../../services/transaction.service';
-import type { PrismaClient } from '@prisma/client';
 
 /**
  * Facade over the configured queues.
@@ -21,8 +19,6 @@ export interface JobServiceOptions {
   /** Optional dead letter queue backing replay/purge operations. */
   deadLetterQueue?: JobQueue;
   events?: JobEventBus;
-  /** Transaction service used for job side effects. */
-  transactions?: TransactionService;
 }
 
 export class JobService {
@@ -30,7 +26,6 @@ export class JobService {
   private readonly createQueue?: (name: string) => JobQueue;
   private readonly events: JobEventBus;
   private readonly deadLetters?: DeadLetterManager;
-  private readonly transactions?: TransactionService;
 
   constructor(options: JobServiceOptions = {}) {
     this.queues = options.queues ?? new Map();
@@ -39,7 +34,6 @@ export class JobService {
     this.deadLetters = options.deadLetterQueue
       ? new DeadLetterManager(options.deadLetterQueue)
       : undefined;
-    this.transactions = options.transactions;
   }
 
   getQueue(name: string): JobQueue {
@@ -62,7 +56,7 @@ export class JobService {
     options: EnqueueOptions = {}
   ): Promise<JobRecord<T>> {
     const queue = this.getQueue(queueName);
-    const job = await queue.enqueue(jobName, data, options);
+    const job = await queue.add(jobName, data, options);
 
     recordJobEnqueued(queueName, jobName, job.priority || 'normal');
     this.events.emit(
@@ -139,41 +133,22 @@ export class JobService {
     if (!this.deadLetters) {
       return null;
     }
-    const queue = this.getQueue(queueName);
-    if (!this.transactions) {
-      return this.deadLetters.replay(id, queue);
-    }
-    return this.transactions.runInTransaction(async (_tx) => {
-      return this.deadLetters!.replay(id, queue);
-    });
+    return this.deadLetters.replay(id, this.getQueue(queueName));
   }
 
   async purgeDeadLetters(): Promise<number> {
     if (!this.deadLetters) {
       return 0;
     }
-    if (!this.transactions) {
-      return this.deadLetters.purge();
-    }
-    return this.transactions.runInTransaction(async (_tx) => {
-      return this.deadLetters!.purge();
-    });
+    return this.deadLetters.purge();
   }
 
   async closeAll(): Promise<void> {
     await Promise.all([...this.queues.values()].map((queue) => queue.close()));
     this.queues.clear();
   }
-
-  getTransactionService(): TransactionService | undefined {
-    return this.transactions;
-  }
 }
 
 export function createJobService(options: JobServiceOptions = {}): JobService {
   return new JobService(options);
-}
-
-export function createJobServiceWithTransactions(transactions: TransactionService, options: JobServiceOptions = {}): JobService {
-  return new JobService({ ...options, transactions });
 }
