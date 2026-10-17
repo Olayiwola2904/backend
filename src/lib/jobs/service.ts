@@ -2,8 +2,8 @@ import { DeadLetterManager, DeadLetterRecord } from './dead-letter';
 import { JobEventBus, createJobEvent, jobEvents as defaultEvents } from './events';
 import { recordJobEnqueued, setDeadLetterCount, updateQueueDepth } from './metrics';
 import { JobSchedule, scheduleJob } from './scheduler';
-import type { TransactionService } from '../../services/transaction.service';
 import { EnqueueOptions, JobQueue, JobRecord, QueueCounts } from './types';
+import { TransactionService, createTransactionService } from '../../services/transaction.service';
 
 /**
  * Facade over the configured queues.
@@ -20,8 +20,8 @@ export interface JobServiceOptions {
   /** Optional dead letter queue backing replay/purge operations. */
   deadLetterQueue?: JobQueue;
   events?: JobEventBus;
-  /** Transaction service used to run multi-step job operations atomically. */
-  transactionService?: TransactionService;
+  /** Transaction service used to persist job state mutations atomically. */
+  transactions?: TransactionService;
 }
 
 export class JobService {
@@ -29,7 +29,7 @@ export class JobService {
   private readonly createQueue?: (name: string) => JobQueue;
   private readonly events: JobEventBus;
   private readonly deadLetters?: DeadLetterManager;
-  private readonly transactions?: TransactionService;
+  private readonly transactions: TransactionService;
 
   constructor(options: JobServiceOptions = {}) {
     this.queues = options.queues ?? new Map();
@@ -38,7 +38,7 @@ export class JobService {
     this.deadLetters = options.deadLetterQueue
       ? new DeadLetterManager(options.deadLetterQueue)
       : undefined;
-    this.transactions = options.transactionService;
+    this.transactions = options.transactions ?? createTransactionService();
   }
 
   getQueue(name: string): JobQueue {
@@ -61,27 +61,23 @@ export class JobService {
     options: EnqueueOptions = {}
   ): Promise<JobRecord<T>> {
     const queue = this.getQueue(queueName);
-    const run = async (_tx?: unknown): Promise<JobRecord<T>> => {
-      const job = await queue.enqueue(jobName, data, options);
+    const job = await this.transactions.runInTransaction(async (_tx) => {
+      return queue.enqueue(jobName, data, options);
+    });
 
-      recordJobEnqueued(queueName, jobName, job.priority || 'normal');
-      this.events.emit(
-        createJobEvent('enqueued', {
-          queue: queueName,
-          jobId: job.id,
-          name: jobName,
-          data,
-          attemptsMade: job.attemptsMade,
-          state: job.state,
-        })
-      );
+    recordJobEnqueued(queueName, jobName, job.priority || 'normal');
+    this.events.emit(
+      createJobEvent('enqueued', {
+        queue: queueName,
+        jobId: job.id,
+        name: jobName,
+        data,
+        attemptsMade: job.attemptsMade,
+        state: job.state,
+      })
+    );
 
-      return job;
-    };
-
-    return this.transactions
-      ? this.transactions.runInTransaction(run, { name: 'job.enqueue' })
-      : run();
+    return job;
   }
 
   async schedule<T>(
@@ -91,15 +87,11 @@ export class JobService {
     schedule: JobSchedule
   ): Promise<JobRecord<T>> {
     const queue = this.getQueue(queueName);
-    const run = async (_tx?: unknown): Promise<JobRecord<T>> => {
-      const job = await scheduleJob(queue, jobName, data, schedule);
-      recordJobEnqueued(queueName, jobName, job.priority || 'normal');
-      return job;
-    };
-
-    return this.transactions
-      ? this.transactions.runInTransaction(run, { name: 'job.schedule' })
-      : run();
+    const job = await this.transactions.runInTransaction(async (_tx) => {
+      return scheduleJob(queue, jobName, data, schedule);
+    });
+    recordJobEnqueued(queueName, jobName, job.priority || 'normal');
+    return job;
   }
 
   async getStatus(queueName: string, jobId: string): Promise<JobRecord | null> {
@@ -127,14 +119,10 @@ export class JobService {
       return false;
     }
 
-    const run = async (_tx?: unknown): Promise<boolean> => {
+    await this.transactions.runInTransaction(async (_tx) => {
       await queue.remove(jobId);
-      return true;
-    };
-
-    return this.transactions
-      ? this.transactions.runInTransaction(run, { name: 'job.cancel' })
-      : run();
+    });
+    return true;
   }
 
   async getQueueDepth(queueName: string): Promise<QueueCounts> {
@@ -156,27 +144,24 @@ export class JobService {
     if (!this.deadLetters) {
       return null;
     }
-    const run = async (_tx?: unknown): Promise<JobRecord | null> =>
-      this.deadLetters!.replay(id, this.getQueue(queueName));
-
-    return this.transactions
-      ? this.transactions.runInTransaction(run, { name: 'job.deadLetter.retry' })
-      : run();
+    return this.transactions.runInTransaction(async (_tx) => {
+      return this.deadLetters!.replay(id, this.getQueue(queueName));
+    });
   }
 
   async purgeDeadLetters(): Promise<number> {
     if (!this.deadLetters) {
       return 0;
     }
-    const run = async (_tx?: unknown): Promise<number> => this.deadLetters!.purge();
-
-    return this.transactions
-      ? this.transactions.runInTransaction(run, { name: 'job.deadLetter.purge' })
-      : run();
+    return this.transactions.runInTransaction(async (_tx) => {
+      return this.deadLetters!.purge();
+    });
   }
 
   async closeAll(): Promise<void> {
-    await Promise.all([...this.queues.values()].map((queue) => queue.close()));
+    await this.transactions.runInTransaction(async (_tx) => {
+      await Promise.all(Array.from(this.queues.values()).map((queue) => queue.close()));
+    });
     this.queues.clear();
   }
 }
@@ -184,4 +169,3 @@ export class JobService {
 export function createJobService(options: JobServiceOptions = {}): JobService {
   return new JobService(options);
 }
-
