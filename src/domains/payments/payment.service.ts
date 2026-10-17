@@ -33,8 +33,9 @@ import { buildCdnUrl } from '../media/media.storage';
 import { TIP_VISIBLE_STATE } from '../moderation/moderation.types';
 import { TipFilterInput, buildTipWhere, describeTipFilters } from './tip-filters';
 import { invalidateCaches, tipCacheKeys } from '../../lib/cache/invalidation';
-/**
+import { withJobTracePayload } from '../../lib/requestContext';
 
+/**
  * Columns required to build a TipResponse.
  * Media columns selected alongside a tip. Only `ready` media is exposed: rows
  * still scanning, rejected, or failed are invisible to tip readers.
@@ -103,7 +104,7 @@ class OptimisticLockError extends Error {
 }
 
 export class PaymentService extends BaseService {
-  private readonly transactionService: TransactionService;
+  private transactionService: TransactionService;
 
   constructor(private prisma: PrismaClient) {
     super();
@@ -285,9 +286,7 @@ export class PaymentService extends BaseService {
       // Create tip in pending state
       let tip;
       try {
-        // Tip creation and media attachment are committed atomically via the
-        // transaction service so a failed attach never leaves a dangling tip.
-        tip = await this.prisma.tip.create({
+        tip = await this.transactionService.createTip({
           data: {
             fromUserId: userId,
             creatorId: data.creatorId,
@@ -333,7 +332,7 @@ export class PaymentService extends BaseService {
         // Stamp `attachedAt` so the media is ordered and the prune sweep can tell
         // an attached upload from an abandoned one. Best-effort: the tip exists
         // and is authoritative even if this bookkeeping write fails.
-        await this.transactionService.attachMediaToTip(
+        await this.stampMediaAttached(
           tip.id,
           attachableMedia.map((media) => media.id)
         );
@@ -363,6 +362,24 @@ export class PaymentService extends BaseService {
     });
 
     return Array.isArray(rows) ? rows : [];
+  }
+
+  /**
+   * Record when media became part of a tip. Best-effort bookkeeping; failures are
+   * logged rather than surfaced because the tip itself is already committed.
+   */
+  private async stampMediaAttached(tipId: string, mediaIds: string[]): Promise<void> {
+    const tipMedia = (this.prisma as unknown as { tipMedia?: any }).tipMedia;
+    if (!tipMedia?.updateMany) return;
+
+    try {
+      await tipMedia.updateMany({
+        where: { id: { in: mediaIds }, tipId },
+        data: { attachedAt: new Date() },
+      });
+    } catch (error) {
+      logger.warn(`Failed to stamp attachedAt for tip ${tipId}: ${(error as Error).message}`);
+    }
   }
 
   /**
@@ -843,6 +860,11 @@ export class PaymentService extends BaseService {
   /**
    * Update tip status (typically used by transaction listener/confirmation service)
    * Can only update to specific statuses based on current state
+   *
+   * Transaction pattern: all state mutations (status transition, optimistic
+   * lock, creator earnings credit) execute inside a single
+   * `transactionService.updateTipStatus` callback transaction. Side effects
+   * (referral commission, webhooks) run after commit and are idempotent.
    */
   async updateTipStatus(tipId: string, data: UpdateTipStatusRequest): Promise<TipResponse> {
     return this.executeWithLogging('payment.updateTipStatus', async () => {
@@ -853,7 +875,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactionService.runTipStatusTransition(async (tx) => {
+          finalTip = await this.transactionService.updateTipStatus(tipId, data.status, async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -924,7 +946,7 @@ export class PaymentService extends BaseService {
             }
 
             return this.formatTipResponse({ ...tip, status: data.status });
-          }, { isolationLevel: 'Serializable' });
+          });
           break; // Exit retry loop on success
         } catch (error: unknown) {
           attempt++;
@@ -1131,7 +1153,7 @@ export class PaymentService extends BaseService {
       }
 
       try {
-        const updatedTip = await this.transactionService.recordTransactionHash({
+        const updatedTip = await this.transactionService.updateTipTransactionHash({
           where: { id: tipId },
           data: {
             transactionHash: result.transactionHash,
@@ -1200,10 +1222,14 @@ export class PaymentService extends BaseService {
       const { stellarConfirmationQueue } = await import('../../lib/queue');
       await stellarConfirmationQueue.add(
         'confirm-transaction',
-        {
-          transactionId: tipId,
-          transactionHash: tip.transactionHash,
-        },
+        withJobTracePayload(
+          {
+            transactionId: tipId,
+            tipId,
+            transactionHash: tip.transactionHash,
+          },
+          { userId: tip.fromUserId }
+        ),
         {
           attempts: 60,
           backoff: { type: 'exponential', delay: 1000 },
@@ -1214,6 +1240,116 @@ export class PaymentService extends BaseService {
 
       // Return current tip status immediately (job runs in background)
       return this.formatTipResponse(tip);
+    });
+  }
+
+  /**
+   * Confirm a submitted transaction by polling the Stellar network and
+   * transitioning the tip to its terminal state.
+   *
+   * This is the synchronous counterpart to `checkTransactionConfirmation`
+   * (which only enqueues an async job). It is invoked by the confirmation
+   * worker and by integration tests that exercise the full confirmation
+   * workflow without a live Redis queue.
+   *
+   * Retry strategy (mirrors the queue's `attempts`/`backoff` config):
+   *  - The worker polls up to `maxAttempts` times with exponential backoff.
+   *  - A transaction that is still pending after the retry limit is left in
+   *    PENDING (the worker gives up; a later sweep may re-enqueue it).
+   *  - Transient network errors during polling are retried; a persistent
+   *    error surfaces as `ServiceUnavailableError` so the job can be retried.
+   *  - Confirmation is idempotent: re-running it against an already-completed
+   *    tip is a no-op (no duplicate earnings, no duplicate webhook).
+   */
+  async confirmTransaction(
+    tipId: string,
+    options: {
+      maxAttempts?: number;
+      baseDelayMs?: number;
+      poll?: (transactionHash: string) => Promise<'success' | 'pending' | 'failed'>;
+    } = {}
+  ): Promise<TipResponse> {
+    return this.executeWithLogging('payment.confirmTransaction', async () => {
+      const maxAttempts = options.maxAttempts ?? 3;
+      const baseDelayMs = options.baseDelayMs ?? 10;
+
+      const tip = await this.prisma.tip.findUnique({
+        where: { id: tipId },
+        select: { id: true, status: true, transactionHash: true },
+      });
+
+      if (!tip) {
+        throw new NotFoundError('Tip');
+      }
+
+      if (!tip.transactionHash) {
+        throw new ValidationError('No transaction hash found for this tip');
+      }
+
+      // Idempotency: a tip that already reached a terminal state is not
+      // re-confirmed. Returning the current record keeps retries safe.
+      if (tip.status === TipStatus.COMPLETED || tip.status === TipStatus.FAILED || tip.status === TipStatus.CANCELLED) {
+        logger.info(
+          { tipId, status: tip.status },
+          'Confirmation skipped: tip already in terminal state'
+        );
+        return this.getTip(tipId);
+      }
+
+      const poll =
+        options.poll ??
+        (async (transactionHash: string) => {
+          const { getTransactionStatus } = await import('../../lib/stellar/transactions');
+          return getTransactionStatus(transactionHash);
+        });
+
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let outcome: 'success' | 'pending' | 'failed';
+        try {
+          outcome = await poll(tip.transactionHash);
+        } catch (error) {
+          lastError = error;
+          logger.warn(
+            { tipId, attempt, maxAttempts, cause: (error as Error).message },
+            'Stellar confirmation poll failed; retrying'
+          );
+          if (attempt < maxAttempts) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, baseDelayMs * Math.pow(2, attempt - 1))
+            );
+            continue;
+          }
+          throw new ServiceUnavailableError(
+            'Unable to confirm transaction on the Stellar network',
+            { tipId, attempts: attempt }
+          );
+        }
+
+        if (outcome === 'success') {
+          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
+        }
+
+        if (outcome === 'failed') {
+          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
+        }
+
+        // Still pending: back off and poll again.
+        if (attempt < maxAttempts) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, baseDelayMs * Math.pow(2, attempt - 1))
+          );
+        }
+      }
+
+      // Pending beyond the retry limit: leave the tip PENDING so a later sweep
+      // can re-enqueue it. Do not mark it FAILED — the transaction may still
+      // land on-chain.
+      logger.warn(
+        { tipId, attempts: maxAttempts, cause: (lastError as Error | undefined)?.message },
+        'Transaction still pending after retry limit; leaving tip in PENDING'
+      );
+      return this.getTip(tipId);
     });
   }
 

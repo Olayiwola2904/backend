@@ -61,8 +61,8 @@ export class PayoutService extends BaseService {
         );
       }
 
-      // Create payout record within a named transaction
-      const payout = await this.txService.createPayoutRecord({
+      // Create payout record through the transaction service
+      const payout = await this.txService.createPayout({
         creatorId,
         amount: data.amount,
         walletAddress: wallet.publicKey,
@@ -105,8 +105,10 @@ export class PayoutService extends BaseService {
         return;
       }
 
-      // Update status to processing via transaction service
-      await this.txService.markPayoutProcessing(payoutId);
+      // Update status to processing through the transaction service
+      await this.txService.updatePayoutStatus(payoutId, {
+        status: 'processing',
+      });
 
       try {
         const stellarClient = getStellarClient();
@@ -150,9 +152,11 @@ export class PayoutService extends BaseService {
 
         logger.info(`Payout transaction submitted successfully: ${result.id}`);
 
-        // Atomically complete payout and decrement pending balance
-        await this.txService.completePayoutAndDebitBalance({
-          payoutId,
+        // Complete payout and decrement pending balance atomically
+        await this.txService.completePayout({
+          payoutId: payoutId,
+          creatorId: payout.creatorId,
+          amount: payout.amount,
           transactionHash: result.id,
         });
 
@@ -164,14 +168,16 @@ export class PayoutService extends BaseService {
 
         // Dispatch webhook event
         await this.dispatchPayoutWebhook(payout, result.id);
-
       } catch (error: any) {
         logger.error(`Payout transaction failed for ${payoutId}:`, error);
 
-        // Update payout status to failed with error message via transaction service
-        await this.txService.markPayoutFailed({
-          payoutId,
+        // Update payout status to failed with error message through the transaction service
+        await this.txService.updatePayoutStatus(payoutId, {
+          status: 'failed',
           errorMessage: error.message || 'Unknown error',
+          retryCount: {
+            increment: 1,
+          },
           nextRetryAt: this.calculateNextRetry(payout.retryCount + 1),
         });
 
@@ -380,8 +386,9 @@ export class PayoutService extends BaseService {
         },
         totalTips,
         recentTips: recentTips.map((tip) => ({
-          id: tip.id
+          id: tip.id,
         })),
+        paidOut,
       };
     });
   }
