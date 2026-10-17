@@ -36,7 +36,7 @@ describe('buildPaymentTransaction memo limit (#180)', () => {
 
     expect(transaction.source).toBe(sender);
     expect(transaction.memo.type).toBe(Memo.text);
-    expect(Buffer.from(transaction.memo.value).toString('utf8')).toBe(memo);
+    expect(Buffer.from(transaction.memo.value as Buffer).toString('utf8')).toBe(memo);
   });
 
   it('rejects a memo over 28 bytes even when it is under 28 characters', async () => {
