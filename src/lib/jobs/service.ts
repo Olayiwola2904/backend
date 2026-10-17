@@ -3,6 +3,7 @@ import { JobEventBus, createJobEvent, jobEvents as defaultEvents } from './event
 import { recordJobEnqueued, setDeadLetterCount, updateQueueDepth } from './metrics';
 import { JobSchedule, scheduleJob } from './scheduler';
 import { EnqueueOptions, JobQueue, JobRecord, QueueCounts } from './types';
+import { TransactionService, createTransactionService } from '../../services/transaction.service';
 
 /**
  * Facade over the configured queues.
@@ -19,6 +20,8 @@ export interface JobServiceOptions {
   /** Optional dead letter queue backing replay/purge operations. */
   deadLetterQueue?: JobQueue;
   events?: JobEventBus;
+  /** Transaction service used to wrap payment state mutations atomically. */
+  transactionService?: TransactionService;
 }
 
 export class JobService {
@@ -26,6 +29,7 @@ export class JobService {
   private readonly createQueue?: (name: string) => JobQueue;
   private readonly events: JobEventBus;
   private readonly deadLetters?: DeadLetterManager;
+  private readonly transactions: TransactionService;
 
   constructor(options: JobServiceOptions = {}) {
     this.queues = options.queues ?? new Map();
@@ -34,6 +38,7 @@ export class JobService {
     this.deadLetters = options.deadLetterQueue
       ? new DeadLetterManager(options.deadLetterQueue)
       : undefined;
+    this.transactions = options.transactionService ?? createTransactionService();
   }
 
   getQueue(name: string): JobQueue {
@@ -56,6 +61,9 @@ export class JobService {
     options: EnqueueOptions = {}
   ): Promise<JobRecord<T>> {
     const queue = this.getQueue(queueName);
+    // Enqueue is a queue mutation, not a payment state mutation, so it is not
+    // wrapped in a database transaction. Payment jobs enqueued here are picked
+    // up by processors that use the transaction service for state changes.
     const job = await queue.enqueue(jobName, data, options);
 
     recordJobEnqueued(queueName, jobName, job.priority || 'normal');
@@ -112,6 +120,10 @@ export class JobService {
 
     await queue.remove(jobId);
     return true;
+  }
+
+  getTransactionService(): TransactionService {
+    return this.transactions;
   }
 
   async getQueueDepth(queueName: string): Promise<QueueCounts> {

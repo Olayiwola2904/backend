@@ -7,14 +7,14 @@ import { getStellarClient } from '../../lib/stellar/client';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { config } from '../../config/env';
 import { invalidateCaches, earningsCacheKey, creatorCacheKeys } from '../../lib/cache/invalidation';
-import { TransactionService } from '../../services/transaction.service';
+import { TransactionService, createTransactionService } from '../../services/transaction.service';
 
 export class PayoutService extends BaseService {
   private readonly txService: TransactionService;
 
   constructor(private prisma: PrismaClient) {
     super();
-    this.txService = new TransactionService(prisma);
+    this.txService = createTransactionService(prisma);
   }
 
   /**
@@ -61,12 +61,8 @@ export class PayoutService extends BaseService {
         );
       }
 
-      // Create payout record through the consolidated transaction service
-      const payout = await this.txService.createPayoutRecord({
-        creatorId,
-        amount: data.amount,
-        walletAddress: wallet.publicKey,
-      });
+      // Create payout record atomically with the balance check (TransactionService)
+      const payout = await this.txService.createPayout(creatorId, data.amount, wallet.publicKey);
 
       logger.info(`Payout request created for creator ${creatorId}: ${data.amount} to ${wallet.publicKey}`);
 
@@ -89,24 +85,14 @@ export class PayoutService extends BaseService {
    */
   private async executePayoutTransaction(payoutId: string): Promise<void> {
     return this.executeWithLogging('payout.executeTransaction', async () => {
-      const payout = await this.prisma.payout.findUnique({
-        where: { id: payoutId },
-        include: {
-          creator: true,
-        },
-      });
+      // Atomically transition pending -> processing via the transaction service.
+      // If another worker already claimed it, this returns null and we bail.
+      const payout = await this.txService.markPayoutProcessing(payoutId);
 
       if (!payout) {
-        throw new NotFoundError('Payout');
-      }
-
-      if (payout.status !== 'pending') {
-        logger.warn(`Payout ${payoutId} is not in pending state: ${payout.status}`);
+        logger.warn(`Payout ${payoutId} is not in pending state or already claimed`);
         return;
       }
-
-      // Update status to processing through the transaction service
-      await this.txService.markPayoutProcessing(payoutId);
 
       try {
         const stellarClient = getStellarClient();
@@ -150,13 +136,11 @@ export class PayoutService extends BaseService {
 
         logger.info(`Payout transaction submitted successfully: ${result.id}`);
 
-        // Atomically mark payout completed and decrement creator pending balance
-        await this.txService.completePayout({
-          payoutId,
-          creatorId: payout.creatorId,
-          amount: payout.amount,
-          transactionHash: result.id,
-        });
+        // Atomically mark completed + decrement pending balance via transaction service.
+        const completed = await this.txService.completePayout(payoutId, result.id);
+        if (!completed) {
+          logger.warn(`Payout ${payoutId} completion skipped; state changed concurrently`);
+        }
 
         logger.info(`Payout completed for creator ${payout.creatorId}: ${payout.amount} XLM`);
         await invalidateCaches(
@@ -170,12 +154,8 @@ export class PayoutService extends BaseService {
       } catch (error: any) {
         logger.error(`Payout transaction failed for ${payoutId}:`, error);
 
-        // Update payout status to failed through the transaction service
-        await this.txService.failPayout({
-          payoutId,
-          errorMessage: error.message || 'Unknown error',
-          nextRetryAt: this.calculateNextRetry(payout.retryCount + 1),
-        });
+        // Mark failed + schedule retry via transaction service.
+        await this.txService.failPayout(payoutId, error.message || 'Unknown error');
 
         throw error;
       }
@@ -183,48 +163,19 @@ export class PayoutService extends BaseService {
   }
 
   /**
-   * Calculate next retry time with exponential backoff
-   */
-  private calculateNextRetry(retryCount: number): Date {
-    const baseDelay = 5 * 60 * 1000; // 5 minutes
-    const maxDelay = 24 * 60 * 60 * 1000; // 24 hours
-    const delay = Math.min(baseDelay * Math.pow(2, retryCount), maxDelay);
-    return new Date(Date.now() + delay);
-  }
-
-  /**
    * Dispatch webhook event for completed payout
    */
   private async dispatchPayoutWebhook(payout: any, transactionHash: string): Promise<void> {
     try {
-      const webhooks = await this.prisma.webhook.findMany({
-        where: {
-          creatorId: payout.creatorId,
-          active: true,
-        },
+      const created = await this.txService.recordPayoutWebhookEvents(payout.creatorId, {
+        payoutId: payout.id,
+        amount: payout.amount,
+        transactionHash,
+        walletAddress: payout.walletAddress,
+        timestamp: new Date().toISOString(),
       });
 
-      for (const webhook of webhooks) {
-        const events = webhook.events as string[];
-        if (events.includes('payout.completed')) {
-          await this.prisma.webhookEvent.create({
-            data: {
-              webhookId: webhook.id,
-              eventType: 'payout.completed',
-              payload: JSON.stringify({
-                payoutId: payout.id,
-                amount: payout.amount,
-                transactionHash,
-                walletAddress: payout.walletAddress,
-                timestamp: new Date().toISOString(),
-              }),
-              status: 'pending',
-            },
-          });
-        }
-      }
-
-      logger.info(`Webhook events dispatched for payout ${payout.id}`);
+      logger.info(`Webhook events dispatched for payout ${payout.id} (${created} created)`);
     } catch (error) {
       logger.error(`Failed to dispatch webhook for payout ${payout.id}:`, error);
       // Don't fail the payout if webhook dispatch fails
@@ -384,8 +335,6 @@ export class PayoutService extends BaseService {
         recentTips: recentTips.map((tip) => ({
           id: tip.id
         })),
-        totalEarnings: creator.totalEarnings,
-        pendingBalance: creator.pendingBalance,
         paidOut,
       };
     });

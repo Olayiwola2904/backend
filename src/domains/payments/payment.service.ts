@@ -1,5 +1,4 @@
-// Transaction handling consolidated via TransactionService (see src/services/transaction.service.ts)
-import { PrismaClient, Tip, Prisma } from '@prisma/client';
+import { PrismaClient, Tip } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import {
   CreateTipRequest,
@@ -35,8 +34,8 @@ import { TipFilterInput, buildTipWhere, describeTipFilters } from './tip-filters
 import { invalidateCaches, tipCacheKeys } from '../../lib/cache/invalidation';
 import { withJobTracePayload } from '../../lib/requestContext';
 import { TransactionService } from '../../services/transaction.service';
-/**
 
+/**
  * Columns required to build a TipResponse.
  * Media columns selected alongside a tip. Only `ready` media is exposed: rows
  * still scanning, rejected, or failed are invisible to tip readers.
@@ -105,11 +104,11 @@ class OptimisticLockError extends Error {
 }
 
 export class PaymentService extends BaseService {
-  private readonly transactionService: TransactionService;
+  private readonly transactions: TransactionService;
 
   constructor(private prisma: PrismaClient) {
     super();
-    this.transactionService = new TransactionService(prisma);
+    this.transactions = new TransactionService(prisma);
   }
 
   /**
@@ -284,32 +283,29 @@ export class PaymentService extends BaseService {
         throw new ValidationError('One or more media items are not ready to be attached');
       }
 
-      // Create tip in pending state
+      // Create tip in pending state via the transaction service so the tip row
+      // and its media attachments commit atomically.
       let tip;
       try {
-        // Tip creation and media attachment are committed atomically through the
-        // transaction service so a tip never exists without its media stamped.
-        tip = await this.transactionService.createTipWithMedia(
-          {
-            fromUserId: userId,
-            creatorId: data.creatorId,
-            amount: data.amount,
-            assetId: requestedAsset?.id ?? null,
-            assetCode: requestedAsset?.code ?? 'USDC',
-            assetIssuer: requestedAsset?.issuer ?? null,
-            assetDecimals: requestedAsset?.decimals ?? 7,
-            message: data.message || null,
-            status: TipStatus.PENDING,
-            idempotencyKey: data.idempotencyKey ?? null,
-          },
-          attachableMedia.map((media) => media.id)
-        );
+        tip = await this.transactions.createTip({
+          fromUserId: userId,
+          creatorId: data.creatorId,
+          amount: data.amount,
+          assetId: requestedAsset?.id ?? null,
+          assetCode: requestedAsset?.code ?? 'USDC',
+          assetIssuer: requestedAsset?.issuer ?? null,
+          assetDecimals: requestedAsset?.decimals ?? 7,
+          message: data.message || null,
+          status: TipStatus.PENDING,
+          idempotencyKey: data.idempotencyKey ?? null,
+          mediaIds: attachableMedia.map((media) => media.id),
+        });
       } catch (error) {
         // Lost a concurrent create race on the same key: replay the winner.
         if (data.idempotencyKey && isUniqueConstraintError(error)) {
-          const existing = await this.transactionService.findTipByIdempotencyKey(
-            data.idempotencyKey
-          );
+          const existing = await this.prisma.tip.findUnique({
+            where: { idempotencyKey: data.idempotencyKey },
+          });
           if (existing) {
             if (existing.fromUserId !== userId) {
               throw new ConflictError('Idempotency key already used by another user');
@@ -328,6 +324,17 @@ export class PaymentService extends BaseService {
         message: tip.message,
         status: tip.status,
       });
+
+      if (attachableMedia.length) {
+        // Stamp `attachedAt` so the media is ordered and the prune sweep can tell
+        // an attached upload from an abandoned one. Best-effort: the tip exists
+        // and is authoritative even if this bookkeeping write fails.
+        await this.stampMediaAttached(
+          tip.id,
+          attachableMedia.map((media) => media.id)
+        );
+        logger.info(`Tip ${tip.id} attached ${attachableMedia.length} media item(s)`);
+      }
 
       return this.formatTipResponse(tip);
     });
@@ -352,6 +359,24 @@ export class PaymentService extends BaseService {
     });
 
     return Array.isArray(rows) ? rows : [];
+  }
+
+  /**
+   * Record when media became part of a tip. Best-effort bookkeeping; failures are
+   * logged rather than surfaced because the tip itself is already committed.
+   */
+  private async stampMediaAttached(tipId: string, mediaIds: string[]): Promise<void> {
+    const tipMedia = (this.prisma as unknown as { tipMedia?: any }).tipMedia;
+    if (!tipMedia?.updateMany) return;
+
+    try {
+      await tipMedia.updateMany({
+        where: { id: { in: mediaIds }, tipId },
+        data: { attachedAt: new Date() },
+      });
+    } catch (error) {
+      logger.warn(`Failed to stamp attachedAt for tip ${tipId}: ${(error as Error).message}`);
+    }
   }
 
   /**
@@ -842,7 +867,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactionService.runTipStatusTransition(async (tx) => {
+          finalTip = await this.transactions.runTipStatusTransition(async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -948,9 +973,10 @@ export class PaymentService extends BaseService {
       if (shouldDispatchWebhook && finalTip) {
         try {
           // Look up the sender's userId from the tip (fromUserId is the referee)
-          const tipRecord = await this.transactionService.findTipSenderAndAmount(
-            finalTip.id
-          );
+          const tipRecord = await this.prisma.tip.findUnique({
+            where: { id: finalTip.id },
+            select: { fromUserId: true, amount: true },
+          });
           if (tipRecord) {
             const { ReferralService } = await import('../referrals/referral.service');
             const referralService = new ReferralService(this.prisma);
@@ -1119,10 +1145,13 @@ export class PaymentService extends BaseService {
       }
 
       try {
-        const updatedTip = await this.transactionService.recordTransactionHash(
-          tipId,
-          result.transactionHash
-        );
+        const updatedTip = await this.transactions.recordTransactionHash({
+          where: { id: tipId },
+          data: {
+            transactionHash: result.transactionHash,
+          },
+          select: { status: true },
+        });
 
         logger.info(
           `Payment transaction submitted for tip: ${tipId}, hash: ${result.transactionHash}`
@@ -1137,9 +1166,10 @@ export class PaymentService extends BaseService {
         // Unique constraint on transactionHash: a concurrent submission already
         // persisted this hash. Never overwrite it — replay the stored value.
         if (isUniqueConstraintError(error)) {
-          const winner = await this.transactionService.findTipTransactionState(
-            tipId
-          );
+          const winner = await this.prisma.tip.findUnique({
+            where: { id: tipId },
+            select: { status: true, transactionHash: true },
+          });
           if (winner?.transactionHash) {
             logger.warn(
               { tipId, transactionHash: winner.transactionHash },
