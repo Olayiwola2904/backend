@@ -1,12 +1,10 @@
-import { Prisma, PrismaClient } from '@prisma/client';
-import type { PrismaClient as PrismaClientType } from '@prisma/client';
+import { PrismaClient } from '@prisma/client';
 
 /** Shared client for modules that are not constructed through application bootstrap. */
-export const prisma: PrismaClientType = new PrismaClient();
+export const prisma = new PrismaClient();
 
-/**
- * Type for the transaction client passed to interactive transaction callbacks.
- * Exported so service layers can accept a transaction scope without creating nested
- * $transaction() calls.
- */
-export type TransactionClient = Prisma.TransactionClient;
+/** Transaction client type exposed for the transaction service. */
+export type PrismaTransactionClient = Omit<
+  PrismaClient,
+  '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'
+>;

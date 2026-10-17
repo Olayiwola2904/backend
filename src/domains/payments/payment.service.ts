@@ -1,5 +1,6 @@
 import { PrismaClient, Tip } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
+import { TransactionService } from '../../services/transaction.service';
 import {
   CreateTipRequest,
   UpdateTipStatusRequest,
@@ -33,7 +34,6 @@ import { TIP_VISIBLE_STATE } from '../moderation/moderation.types';
 import { TipFilterInput, buildTipWhere, describeTipFilters } from './tip-filters';
 import { invalidateCaches, tipCacheKeys } from '../../lib/cache/invalidation';
 import { withJobTracePayload } from '../../lib/requestContext';
-import { TransactionService } from '../../services/transaction.service';
 
 /**
  * Columns required to build a TipResponse.
@@ -283,8 +283,7 @@ export class PaymentService extends BaseService {
         throw new ValidationError('One or more media items are not ready to be attached');
       }
 
-      // Create tip in pending state via the transaction service so the tip row
-      // and its media attachments commit atomically.
+      // Create tip in pending state
       let tip;
       try {
         tip = await this.transactions.createTip({
@@ -296,7 +295,6 @@ export class PaymentService extends BaseService {
           assetIssuer: requestedAsset?.issuer ?? null,
           assetDecimals: requestedAsset?.decimals ?? 7,
           message: data.message || null,
-          status: TipStatus.PENDING,
           idempotencyKey: data.idempotencyKey ?? null,
           mediaIds: attachableMedia.map((media) => media.id),
         });
@@ -325,17 +323,6 @@ export class PaymentService extends BaseService {
         status: tip.status,
       });
 
-      if (attachableMedia.length) {
-        // Stamp `attachedAt` so the media is ordered and the prune sweep can tell
-        // an attached upload from an abandoned one. Best-effort: the tip exists
-        // and is authoritative even if this bookkeeping write fails.
-        await this.stampMediaAttached(
-          tip.id,
-          attachableMedia.map((media) => media.id)
-        );
-        logger.info(`Tip ${tip.id} attached ${attachableMedia.length} media item(s)`);
-      }
-
       return this.formatTipResponse(tip);
     });
   }
@@ -359,24 +346,6 @@ export class PaymentService extends BaseService {
     });
 
     return Array.isArray(rows) ? rows : [];
-  }
-
-  /**
-   * Record when media became part of a tip. Best-effort bookkeeping; failures are
-   * logged rather than surfaced because the tip itself is already committed.
-   */
-  private async stampMediaAttached(tipId: string, mediaIds: string[]): Promise<void> {
-    const tipMedia = (this.prisma as unknown as { tipMedia?: any }).tipMedia;
-    if (!tipMedia?.updateMany) return;
-
-    try {
-      await tipMedia.updateMany({
-        where: { id: { in: mediaIds }, tipId },
-        data: { attachedAt: new Date() },
-      });
-    } catch (error) {
-      logger.warn(`Failed to stamp attachedAt for tip ${tipId}: ${(error as Error).message}`);
-    }
   }
 
   /**
@@ -867,7 +836,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactions.runTipStatusTransition(async (tx) => {
+          finalTip = await this.transactions.runInTransaction(async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -1319,7 +1288,7 @@ export class PaymentService extends BaseService {
         }
 
         if (outcome === 'success') {
-          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
+          return this.transactions.confirmTip(tipId);
         }
 
         if (outcome === 'failed') {
