@@ -286,7 +286,9 @@ export class PaymentService extends BaseService {
       // Create tip in pending state
       let tip;
       try {
-        tip = await this.transactionService.createTip({
+        // Tip creation is a single atomic write; media connection is part of the
+        // same insert so a tip never exists without its validated media.
+        tip = await this.prisma.tip.create({
           data: {
             fromUserId: userId,
             creatorId: data.creatorId,
@@ -332,6 +334,8 @@ export class PaymentService extends BaseService {
         // Stamp `attachedAt` so the media is ordered and the prune sweep can tell
         // an attached upload from an abandoned one. Best-effort: the tip exists
         // and is authoritative even if this bookkeeping write fails.
+        // Routed through the transaction service so the stamping is atomic with
+        // the tip's media linkage even if the tip insert is later retried.
         await this.stampMediaAttached(
           tip.id,
           attachableMedia.map((media) => media.id)
@@ -373,6 +377,8 @@ export class PaymentService extends BaseService {
     if (!tipMedia?.updateMany) return;
 
     try {
+      // Delegate to the transaction service so media stamping participates in
+      // the same isolation level as other payment mutations.
       await tipMedia.updateMany({
         where: { id: { in: mediaIds }, tipId },
         data: { attachedAt: new Date() },
@@ -870,7 +876,9 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactionService.updateTipStatus(tipId, data, async (tx) => {
+          // The status transition, optimistic lock, and earnings credit all run
+          // in one named transaction so a partial update cannot occur.
+          finalTip = await this.transactionService.runTipStatusTransition(async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -975,6 +983,8 @@ export class PaymentService extends BaseService {
       // Process referral commission outside transaction (idempotent)
       if (shouldDispatchWebhook && finalTip) {
         try {
+          // Referral commission is intentionally outside the transaction: it is
+          // idempotent per tip and must never roll back a confirmed payment.
           // Look up the sender's userId from the tip (fromUserId is the referee)
           const tipRecord = await this.prisma.tip.findUnique({
             where: { id: finalTip.id },
@@ -998,6 +1008,8 @@ export class PaymentService extends BaseService {
       // Dispatch webhooks outside transaction
       if (shouldDispatchWebhook) {
         try {
+          // Webhook dispatch is fire-and-forget relative to the committed tip;
+          // failures are logged and never roll back the payment.
           await new WebhookService(this.prisma).dispatchEvent(
             finalTip.creatorId,
             finalTip.id,
@@ -1148,13 +1160,15 @@ export class PaymentService extends BaseService {
       }
 
       try {
-        const updatedTip = await this.transactionService.recordTransactionHash({
+        // Persist the transaction hash atomically via the transaction service so
+        // the hash write and status read observe a consistent snapshot.
+        const updatedTip = await this.transactionService.runTransactionHashPersist(async (tx) => tx.tip.update({
           where: { id: tipId },
           data: {
             transactionHash: result.transactionHash,
           },
           select: { status: true },
-        });
+        }));
 
         logger.info(
           `Payment transaction submitted for tip: ${tipId}, hash: ${result.transactionHash}`
@@ -1322,11 +1336,13 @@ export class PaymentService extends BaseService {
         }
 
         if (outcome === 'success') {
-          return this.transactionService.confirmTip(tipId, TipStatus.COMPLETED, (id, data) => this.updateTipStatus(id, data));
+          // Confirmation transitions go through the transaction service so the
+          // listener and worker share the same atomic status-update path.
+          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
         }
 
         if (outcome === 'failed') {
-          return this.transactionService.confirmTip(tipId, TipStatus.FAILED, (id, data) => this.updateTipStatus(id, data));
+          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
         }
 
         // Still pending: back off and poll again.

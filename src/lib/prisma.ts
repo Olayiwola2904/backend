@@ -5,7 +5,6 @@ export const prisma = new PrismaClient();
 
 /**
  * Type for the transaction client passed to interactive transaction callbacks.
- * Exported so service layers can accept a transaction scope without creating nested
- * $transaction calls.
+ * Exported so services can accept a transaction scope without re-declaring it.
  */
-export type PrismaTransactionClient = Omit<PrismaClient, '$connect' | '$disconnect' | '$transaction' | '$on' | '$use' | '$extend'>;
+export type TransactionClient = Oismit<PrismaClient, '$connect' | '$disconnect' | '$extend' | '$transaction' | '$on'>;
