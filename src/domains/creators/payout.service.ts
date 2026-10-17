@@ -7,14 +7,14 @@ import { getStellarClient } from '../../lib/stellar/client';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { config } from '../../config/env';
 import { invalidateCaches, earningsCacheKey, creatorCacheKeys } from '../../lib/cache/invalidation';
-import { TransactionService, createTransactionService } from '../../services/transaction.service';
+import { TransactionService } from '../../services/transaction.service';
 
 export class PayoutService extends BaseService {
   private readonly txService: TransactionService;
 
   constructor(private prisma: PrismaClient) {
     super();
-    this.txService = createTransactionService(prisma);
+    this.txService = new TransactionService(prisma);
   }
 
   /**
@@ -61,8 +61,8 @@ export class PayoutService extends BaseService {
         );
       }
 
-      // Create payout record via transaction service (atomic)
-      const payout = await this.txService.createPayout({
+      // Create payout record through the consolidated transaction service
+      const payout = await this.txService.createPayoutRecord({
         creatorId,
         amount: data.amount,
         walletAddress: wallet.publicKey,
@@ -105,13 +105,8 @@ export class PayoutService extends BaseService {
         return;
       }
 
-      // Atomically claim the payout for processing. If another worker already
-      // claimed it, bail out to avoid double spending.
-      const claimed = await this.txService.markPayoutProcessing(payoutId);
-      if (!claimed) {
-        logger.warn(`Payout ${payoutId} was already claimed or is no longer pending`);
-        return;
-      }
+      // Update status to processing via transaction service
+      await this.txService.markPayoutProcessing(payoutId);
 
       try {
         const stellarClient = getStellarClient();
@@ -155,10 +150,9 @@ export class PayoutService extends BaseService {
 
         logger.info(`Payout transaction submitted successfully: ${result.id}`);
 
-        // Atomically complete the payout and decrement the creator's pending
-        // balance in a single transaction.
+        // Atomically complete payout and decrement creator's pending balance
         await this.txService.completePayout({
-          payoutId: payoutId,
+          payoutId,
           creatorId: payout.creatorId,
           amount: payout.amount,
           transactionHash: result.id,
@@ -176,7 +170,7 @@ export class PayoutService extends BaseService {
       } catch (error: any) {
         logger.error(`Payout transaction failed for ${payoutId}:`, error);
 
-        // Atomically mark the payout as failed with retry metadata.
+        // Update payout status to failed with error message via transaction service
         await this.txService.failPayout({
           payoutId,
           errorMessage: error.message || 'Unknown error',
@@ -260,13 +254,6 @@ export class PayoutService extends BaseService {
 
       for (const payout of failedPayouts) {
         try {
-          // Reset to pending so the claim guard in executePayoutTransaction
-          // can take effect. This is a single write and does not need to
-          // be atomic with the execution flow.
-          await this.prisma.payout.update({
-            where: { id: payout.id },
-            data: { status: 'pending' as any },
-          });
           await this.executePayoutTransaction(payout.id);
         } catch (error) {
           logger.error(`Failed to retry payout ${payout.id}:`, error);
@@ -386,20 +373,22 @@ export class PayoutService extends BaseService {
       return {
         creator: {
           id: creator.id,
-          email: creator.user.email,
-          name: creator.user.name,
-          totalEarnings: creator.totalEarnings,
-          pendingBalance: creator.pendingBalance,
-          paidOut,
-          totalTips,
-          recentTips: recentTips.map((tip) => ({
-            id: tip.id,
-            amount: tip.amount,
-            status: tip.status,
-            fromUserName: tip.fromUser?.name,
-            createdAt: tip.createdAt.toISOString(),
-          })),
+          username: creator.username,
+          displayName: creator.displayName,
+          bio: creator.bio,
+          avatar: creator.avatar,
+          verified: creator.verified,
+          isPublic: creator.isPublic,
         },
+        totalTips,
+        paidOut,
+        recentTips: recentTips.map((tip) => ({
+          id: tip.id,
+          amount: tip.amount,
+          status: tip.status,
+          createdAt: tip.createdAt.toISOString(),
+          fromUserName: tip.fromUser ? tip.fromUser.name : null,
+        })),
       };
     });
   }
