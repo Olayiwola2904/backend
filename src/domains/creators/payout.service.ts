@@ -61,9 +61,8 @@ export class PayoutService extends BaseService {
         );
       }
 
-      // Create payout record via the transaction service so it is atomic
-      // with any future side writes added to this operation.
-      const payout = await this.txService.createPayoutRecord({
+      // Create payout record atomically (re-validates balance inside the tx)
+      const payout = await this.txService.createPayout({
         creatorId,
         amount: data.amount,
         walletAddress: wallet.publicKey,
@@ -106,11 +105,10 @@ export class PayoutService extends BaseService {
         return;
       }
 
-      // Transition pending -> processing atomically; a concurrent worker
-      // that won the race makes this a no-op.
-      const claimed = await this.txService.markPayoutProcessing(payoutId);
-      if (!claimed) {
-        logger.warn(`Payout ${payoutId} was already claimed by another worker`);
+      // Atomically transition pending -> processing (guarded against races)
+      const marked = await this.txService.markPayoutProcessing(payoutId);
+      if (!marked) {
+        logger.warn(`Payout ${payoutId} could not be transitioned to processing`);
         return;
       }
 
@@ -156,12 +154,16 @@ export class PayoutService extends BaseService {
 
         logger.info(`Payout transaction submitted successfully: ${result.id}`);
 
-        // Atomically mark completed and decrement the creator's pending
-        // balance in a single transaction.
-        const completion = await this.txService.completePayout(payoutId, result.id);
-        if (!completion) {
-          logger.warn(`Payout ${payoutId} completion was already recorded; skipping credit`);
-          return;
+        // Atomically mark payout completed and decrement creator pending balance
+        const { completed } = await this.txService.completePayout({
+          payoutId,
+          creatorId: payout.creatorId,
+          amount: payout.amount,
+          transactionHash: result.id,
+        });
+
+        if (!completed) {
+          logger.warn(`Payout ${payoutId} completion skipped; state changed concurrently`);
         }
 
         logger.info(`Payout completed for creator ${payout.creatorId}: ${payout.amount} XLM`);
@@ -176,12 +178,12 @@ export class PayoutService extends BaseService {
       } catch (error: any) {
         logger.error(`Payout transaction failed for ${payoutId}:`, error);
 
-        // Mark failed with retry bookkeeping atomically.
-        await this.txService.failPayout(
+        // Atomically mark payout as failed with retry bookkeeping
+        await this.txService.failPayout({
           payoutId,
-          error.message || 'Unknown error',
-          this.calculateNextRetry(payout.retryCount + 1)
-        );
+          errorMessage: error.message || 'Unknown error',
+          nextRetryAt: this.calculateNextRetry(payout.retryCount + 1),
+        });
 
         throw error;
       }
@@ -210,22 +212,24 @@ export class PayoutService extends BaseService {
         },
       });
 
-      const matchingWebhookIds = webhooks.filter((webhook) => {
+      for (const webhook of webhooks) {
         const events = webhook.events as string[];
-        return events.includes('payout.completed');
-      }).map((webhook) => webhook.id);
-
-      if (matchingWebhookIds.length > 0) {
-        const payload = JSON.stringify({
-          payoutId: payout.id,
-          amount: payout.amount,
-          transactionHash,
-          walletAddress: payout.walletAddress,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Persist all webhook events in a single transaction.
-        await this.txService.recordPayoutWebhookEvents(matchingWebhookIds, payload);
+        if (events.includes('payout.completed')) {
+          await this.prisma.webhookEvent.create({
+            data: {
+              webhookId: webhook.id,
+              eventType: 'payout.completed',
+              payload: JSON.stringify({
+                payoutId: payout.id,
+                amount: payout.amount,
+                transactionHash,
+                walletAddress: payout.walletAddress,
+                timestamp: new Date().toISOString(),
+              }),
+              status: 'pending',
+            },
+          });
+        }
       }
 
       logger.info(`Webhook events dispatched for payout ${payout.id}`);

@@ -1,4 +1,4 @@
-/*
+/**
  * Scheduled creator payouts (#222).
  *
  * A creator can configure a recurring payout (daily, weekly, monthly, or a
@@ -16,11 +16,6 @@
  * and the scheduler registration calls are fully implemented, but end-to-end
  * "a cron fires and a real payout executes" has not been exercised against a
  * live Redis instance in this session; see the PR body's Disclosures section.
- *
- * Transaction handling: all payment state mutations (create, pause, resume,
- * cancel, and run-outcome recording) go through the consolidated
- * `services/transaction.service` wrapper so they execute atomically with a
- * defined isolation level and no nested `$prisma.$transaction()` calls.
  */
 import { PrismaClient, ScheduledPaymentStatus } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
@@ -50,11 +45,11 @@ export interface ScheduledPayoutView {
 const SCHEDULED_PAYOUT_JOB_NAME = 'execute-scheduled-payout';
 
 export class ScheduledPayoutService extends BaseService {
-  private transactions: TransactionService;
+  private transactionService: TransactionService;
 
   constructor(private prisma: PrismaClient) {
     super();
-    this.transactions = new TransactionService(prisma);
+    this.transactionService = new TransactionService(prisma);
   }
 
   /**
@@ -84,16 +79,12 @@ export class ScheduledPayoutService extends BaseService {
         throw new ValidationError(cronCheck.reason ?? 'Invalid cron expression');
       }
 
-      const scheduled = await this.transactions.runInTransaction(async (tx) => {
-        return tx.scheduledPayment.create({
-          data: {
-            creatorId,
-            amount: input.amount,
-            walletAddress: input.walletAddress ?? null,
-            cronExpression,
-            status: ScheduledPaymentStatus.active,
-          },
-        });
+      const scheduled = await this.transactionService.createScheduledPayout({
+        creatorId,
+        amount: input.amount,
+        walletAddress: input.walletAddress ?? null,
+        cronExpression,
+        status: ScheduledPaymentStatus.active,
       });
 
       await this.registerJobScheduler(scheduled.id, cronExpression, creatorId);
@@ -138,12 +129,10 @@ export class ScheduledPayoutService extends BaseService {
         await scheduledPayoutQueue.removeJobScheduler(row.id);
       }
 
-      const updated = await this.transactions.runInTransaction(async (tx) => {
-        return tx.scheduledPayment.update({
-          where: { id: row.id },
-          data: { status: ScheduledPaymentStatus.paused },
-        });
-      });
+      const updated = await this.transactionService.updateScheduledPayoutStatus(
+        row.id,
+        ScheduledPaymentStatus.paused
+      );
 
       logger.info({ creatorId, scheduledPaymentId: row.id }, 'Scheduled payout paused');
       return this.formatScheduledPayout(updated);
@@ -163,12 +152,10 @@ export class ScheduledPayoutService extends BaseService {
 
       await this.registerJobScheduler(row.id, row.cronExpression, creatorId);
 
-      const updated = await this.transactions.runInTransaction(async (tx) => {
-        return tx.scheduledPayment.update({
-          where: { id: row.id },
-          data: { status: ScheduledPaymentStatus.active },
-        });
-      });
+      const updated = await this.transactionService.updateScheduledPayoutStatus(
+        row.id,
+        ScheduledPaymentStatus.active
+      );
 
       logger.info({ creatorId, scheduledPaymentId: row.id }, 'Scheduled payout resumed');
       return this.formatScheduledPayout(updated);
@@ -187,12 +174,10 @@ export class ScheduledPayoutService extends BaseService {
         await scheduledPayoutQueue.removeJobScheduler(row.id);
       }
 
-      const updated = await this.transactions.runInTransaction(async (tx) => {
-        return tx.scheduledPayment.update({
-          where: { id: row.id },
-          data: { status: ScheduledPaymentStatus.cancelled },
-        });
-      });
+      const updated = await this.transactionService.updateScheduledPayoutStatus(
+        row.id,
+        ScheduledPaymentStatus.cancelled
+      );
 
       logger.info({ creatorId, scheduledPaymentId: row.id }, 'Scheduled payout cancelled');
       return this.formatScheduledPayout(updated);
@@ -205,15 +190,9 @@ export class ScheduledPayoutService extends BaseService {
     outcome: { payoutId?: string; error?: string }
   ): Promise<void> {
     return this.executeWithLogging('scheduledPayout.recordRunOutcome', async () => {
-      await this.transactions.runInTransaction(async (tx) => {
-        await tx.scheduledPayment.update({
-          where: { id },
-          data: {
-            lastRunAt: new Date(),
-            lastPayoutId: outcome.payoutId ?? null,
-            lastRunError: outcome.error ?? null,
-          },
-        });
+      await this.transactionService.recordScheduledPayoutRunOutcome(id, {
+        payoutId: outcome.payoutId ?? null,
+        error: outcome.error ?? null,
       });
     });
   }

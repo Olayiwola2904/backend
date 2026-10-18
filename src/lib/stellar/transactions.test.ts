@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { Keypair, MemoText } from '@stellar/stellar-sdk';
+import { Keypair, MemoText } from '@stellar/stellar-sdk;'
 import { buildPaymentTransaction } from './transactions';
 import { MEMO_MAX_LENGTH } from './validation';
 
@@ -9,7 +9,7 @@ const recipient = Keypair.random().publicKey();
 // Horizon is never contacted: the client hands back a local account so the
 // builder can be exercised offline.
 vi.mock('./client', async () => {
-  const sdk = await import('@stellar/stellar-sdk');
+  const sdk = await import('@stellar/stellar-sdk;');
   return {
     getStellarClient: () => ({
       getServer: () => ({
@@ -35,7 +35,7 @@ describe('buildPaymentTransaction memo limit (#180)', () => {
     const transaction = await buildPaymentTransaction(payment(memo));
 
     expect(transaction.source).toBe(sender);
-    expect(transaction.memo.type).toB(MemoText);
+    expect(transaction.memo.type).toBe(MemoText);
     expect(Buffer.from(transaction.memo.value).toString('utf8')).toBe(memo);
   });
 

@@ -83,14 +83,10 @@ export async function pollForTransactionConfirmation(
  * Update tip status based on transaction confirmation
  * Used to transition tip from pending to completed/failed based on network confirmation
  *
- * All state mutations go through the TransactionService so related writes
- * (tip status + creator balances) execute atomically and nesting is
- * eliminated.
- *
  * @param prisma Prisma client instance
  * @param tipId Tip to update
  * @param transactionHash Transaction hash to verify
- * @param txService Optional pre-configured transaction service (defaults to a new one)
+ * @param txService Optional transaction service override (defaults to one backed by prisma)
  * @returns Updated tip or throws on error
  */
 export async function updateTipStatusFromTransaction(
@@ -126,8 +122,8 @@ export async function updateTipStatusFromTransaction(
 
       // Atomic transition + earnings credit; a parallel confirmer that wins the
       // race makes this a no-op so earnings cannot be doubled.
-      const result = await txService.completeTipAtomically(tip);
-      if (result.credited) {
+      const { credited } = await txService.completeTipAtomically(tip);
+      if (credited) {
         logger.info(
           `Tip confirmed and completed: ${tipId}, creator earnings updated by ${tip.amount}`
         );
@@ -146,7 +142,6 @@ export async function updateTipStatusFromTransaction(
       // Only mark as failed if still pending
       if (tip.status === 'pending') {
         await txService.markTipFailed(tipId);
-
         logger.warn(`Tip marked as failed: ${tipId}, reason: ${confirmationResult.error}`);
       }
     }
@@ -161,7 +156,6 @@ export async function updateTipStatusFromTransaction(
 
       if (tip && tip.status === 'pending') {
         await txService.markTipFailed(tipId);
-
         logger.warn(`Tip marked as failed due to error: ${tipId}`);
       }
     } catch (updateError) {
@@ -178,7 +172,7 @@ export async function updateTipStatusFromTransaction(
  * @param prisma Prisma client instance
  * @param creatorPublicKey Creator's Stellar public key
  * @param targetAssetCode Optional: only process payments for this asset (e.g., 'USDC')
- * @param txService Optional pre-configured transaction service
+ * @param txService Optional transaction service override (defaults to one backed by prisma)
  * @returns Function to close the stream
  */
 export async function streamCreatorPayments(
@@ -226,9 +220,9 @@ export async function streamCreatorPayments(
             if (tip) {
               logger.info(`Confirming tip from payment stream: ${tip.id}`);
 
-              // Atomic transition + earnings credit via the transaction service.
-              const result = await txService.completeTipAtomically(tip);
-              if (result.credited) {
+              // Atomic transition + earnings credit (through the transaction service).
+              const { credited } = await txService.completeTipAtomically(tip);
+              if (credited) {
                 logger.info(
                   `Tip auto-confirmed from payment stream: ${tip.id}, amount: ${tip.amount}`
                 );
@@ -262,7 +256,7 @@ export async function streamCreatorPayments(
  * Call this periodically (e.g., every 30 seconds) to confirm pending tips
  *
  * @param prisma Prisma client instance
- * @param txService Optional pre-configured transaction service
+ * @param txService Optional transaction service override (defaults to one backed by prisma)
  * @returns Number of tips processed
  */
 export async function processPendingTips(
@@ -299,9 +293,9 @@ export async function processPendingTips(
           );
 
           if (confirmationResult.confirmed && confirmationResult.result) {
-            // Atomic transition + earnings credit via the transaction service.
-            const result = await txService.completeTipAtomically(tip);
-            if (result.credited) {
+            // Atomic transition + earnings credit (through the transaction service).
+            const { credited } = await txService.completeTipAtomically(tip);
+            if (credited) {
               confirmed++;
               logger.info(`Confirmed pending tip: ${tip.id}`);
             }

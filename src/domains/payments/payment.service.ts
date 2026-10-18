@@ -103,12 +103,11 @@ class OptimisticLockError extends Error {
 }
 
 export class PaymentService extends BaseService {
+  private readonly transactions: TransactionService;
+
   constructor(private prisma: PrismaClient) {
     super();
-  }
-
-  private get transactions(): TransactionService {
-    return new TransactionService(this.prisma);
+    this.transactions = new TransactionService(prisma);
   }
 
   /**
@@ -275,7 +274,7 @@ export class PaymentService extends BaseService {
       // Create tip in pending state
       let tip;
       try {
-        tip = await this.prisma.tip.create({
+        tip = await this.transactions.createTip({
           data: {
             fromUserId: userId,
             creatorId: data.creatorId,
@@ -895,7 +894,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactions.runTipStatusTransition(async (tx) => {
+          finalTip = await this.transactions.updateTipStatusWithEarnings(tipId, async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -1173,13 +1172,13 @@ export class PaymentService extends BaseService {
       }
 
       try {
-        const updatedTip = await this.transactions.runTipTransactionHashUpdate(async (tx) => tx.tip.update({
+        const updatedTip = await this.transactions.recordTransactionHash({
           where: { id: tipId },
           data: {
             transactionHash: result.transactionHash,
           },
           select: { status: true },
-        }));
+        });
 
         logger.info(
           `Payment transaction submitted for tip: ${tipId}, hash: ${result.transactionHash}`
@@ -1347,11 +1346,11 @@ export class PaymentService extends BaseService {
         }
 
         if (outcome === 'success') {
-          return this.transactions.runTipConfirmation(tipId, TipStatus.COMPLETED, (id, data) => this.updateTipStatus(id, data));
+          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
         }
 
         if (outcome === 'failed') {
-          return this.transactions.runTipConfirmation(tipId, TipStatus.FAILED, (id, data) => this.updateTipStatus(id, data));
+          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
         }
 
         // Still pending: back off and poll again.
