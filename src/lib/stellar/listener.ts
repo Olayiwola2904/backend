@@ -1,7 +1,10 @@
 import { PrismaClient } from '@prisma/client';
 import { getStellarClient } from './client';
 import { logger } from '../../utils/logger';
-import { transactionService } from '../../services/transaction.service';
+import {
+  transactionService,
+  TransactionService,
+} from '../../services/transaction.service';
 
 export interface TransactionListener {
   tipId: string;
@@ -12,10 +15,10 @@ export interface TransactionListener {
 
 /**
  * Poll for transaction confirmation on Horizon
- * Checks periodically if a transaction has been confirmed on the Stellar worker
+ * Checks periodically if a transaction has been confirmed on the Stellar network
  *
  * @param transactionHash Transaction to monitor
- * @param maxAttempts Maximum polling attempts (default 60 = ~ 60 seconds at 1s interval)
+ * @param maxAttempts Maximum polling attempts (default 60 = ~~60 seconds at 1s interval)
  * @param pollIntervalMs Interval between polls in milliseconds (default 1000)
  * @returns Confirmation status with transaction details if confirmed
  */
@@ -80,19 +83,34 @@ export async function pollForTransactionConfirmation(
 }
 
 /**
+ * Resolve the transaction service to use. Allows tests to inject a custom
+ * instance while production code falls back to the shared singleton.
+ */
+function resolveTransactionService(custom?: TransactionService): TransactionService {
+  return custom ?? transactionService;
+}
+
+/**
  * Update tip status based on transaction confirmation
  * Used to transition tip from pending to completed/failed based on network confirmation
  *
- * @param prisma Prisma client instance
+ * The state mutations are delegated to the transaction service so the transition and
+ * the creator earnings credit execute atomically in a single transaction.
+ *
+ * @param payments Prisma client instance (kept for backward compatibility)
  * @param tipId Tip to update
  * @param transactionHash Transaction hash to verify
- * @returns Updated tip or throws on error
+ * @param txService Optional transaction service override (for testing)
+ * @returns Void or throws on error
  */
 export async function updateTipStatusFromTransaction(
-  prisma: PrismaClient,
+  payments: PrismaClient,
   tipId: string,
-  transactionHash: string
+  transactionHash: string,
+  txService?: TransactionService
 ): Promise<void> {
+  const tx = resolveTransactionService(txService);
+
   try {
     logger.debug(
       `Updating tip status based on transaction confirmation: ${tipId} (${transactionHash})`
@@ -103,7 +121,7 @@ export async function updateTipStatusFromTransaction(
 
     if (confirmationResult.confirmed && confirmationResult.result) {
       // Transaction is confirmed on the network - update tip to completed
-      const tip = await prisma.tip.findUnique({
+      const tip = await payments.tip.findUnique({
         where: { id: tipId },
       });
 
@@ -118,9 +136,9 @@ export async function updateTipStatusFromTransaction(
         return;
       }
 
-      // Atomic transition + earnings credit; a parallel confirmer that wins the
-      // race makes this a no-op so earnings cannot be doubled.
-      const credited = await transactionService.completeTipAtomically(tip);
+      // Atomic transition + earnings credit via the transaction service. A parallel
+      // confirmer that wins the race makes this a no-op so earnings cannot be doubled.
+      const credited = await tx.completeTipAndCreditEarnings(tipId);
       if (credited) {
         logger.info(
           `Tip confirmed and completed: ${tipId}, creator earnings updated by ${tip.amount}`
@@ -128,7 +146,7 @@ export async function updateTipStatusFromTransaction(
       }
     } else {
       // Transaction failed or timed out
-      const tip = await prisma.tip.findUnique({
+      const tip = await payments.tip.findUnique({
         where: { id: tipId },
       });
 
@@ -139,7 +157,7 @@ export async function updateTipStatusFromTransaction(
 
       // Only mark as failed if still pending
       if (tip.status === 'pending') {
-        await transactionService.markTipAsFailed(tipId);
+        await tx.failTip(tipId);
 
         logger.warn(`Tip marked as failed: ${tipId}, reason: ${confirmationResult.error}`);
       }
@@ -149,12 +167,12 @@ export async function updateTipStatusFromTransaction(
 
     // Attempt to mark as failed to prevent hanging pending status
     try {
-      const tip = await prisma.tip.findUnique({
+      const tip = await payments.tip.findUnique({
         where: { id: tipId },
       });
 
       if (tip && tip.status === 'pending') {
-        await transactionService.markTipAsFailed(tipId);
+        await tx.failTip(tipId);
 
         logger.warn(`Tip marked as failed due to error: ${tipId}`);
       }
@@ -169,19 +187,20 @@ export async function updateTipStatusFromTransaction(
  * Used to detect incoming USDC payments to a creator's wallet
  * Updates corresponding tips in real-time when payments are detected
  *
- * @param prisma Prisma client instance
+ * @param payments Prisma client instance
  * @param creatorPublicKey Creator's Stellar public key
  * @param targetAssetCode Optional: only process payments for this asset (e.g., 'USDC')
+ * @param txService Optional transaction service override (for testing)
  * @returns Function to close the stream
  */
 export async function streamCreatorPayments(
-  prisma: PrismaClient,
+  payments: PrismaClient,
   creatorPublicKey: string,
-  targetAssetCode?: string
-): Promise<{
-  close: () => void;
-  closeStream: () => void;
-}> {
+  targetAssetCode?: string,
+  txService?: TransactionService
+): Promise< () => void> {
+  const tx = resolveTransactionService(txService);
+
   try {
     logger.debug(
       `Starting payment stream for creator: ${creatorPublicKey}${targetAssetCode ? ` (asset: ${targetAssetCode})` : ''}`
@@ -211,7 +230,7 @@ export async function streamCreatorPayments(
             );
 
             // Find matching tip by transaction hash
-            const tip = await prisma.tip.findFirst({
+            const tip = await payments.tip.findFirst({
               where: {
                 transactionHash: payment.transaction_hash,
                 status: 'pending',
@@ -221,8 +240,8 @@ export async function streamCreatorPayments(
             if (tip) {
               logger.info(`Confirming tip from payment stream: ${tip.id}`);
 
-              // Atomic transition + earnings credit (see completeTipAtomically).
-              const credited = await transactionService.completeTipAtomically(tip);
+              // Atomic transition + earnings credit via the transaction service.
+              const credited = await tx.completeTipAndCreditEarnings(tip.id);
               if (credited) {
                 logger.info(
                   `Tip auto-confirmed from payment stream: ${tip.id}, amount: ${tip.amount}`
@@ -244,111 +263,9 @@ export async function streamCreatorPayments(
       });
 
     logger.info(`Payment stream started for creator: ${creatorPublicKey}`);
-    return { close: closeStream, closeStream };
+    return closeStream;
   } catch (error) {
     logger.error(`Failed to start payment stream for creator: ${creatorPublicKey}`, error);
     throw error;
   }
-}
-
-/**
- * Background job to process pending tips
- * Polls Horizon for confirmation of pending transactions
- * Call this periodically (e.g., every 30 seconds) to confirm pending tips
- *
- * @param prisma Prisma client instance
- * @returns Number of tips processed
- */
-export async function processPendingTips(prisma: PrismaClient): Promise<number> {
-  try {
-    logger.debug('Processing pending tips');
-
-    // Find all pending tips with transaction hashes
-    const pendingTips = await prisma.tip.findMany({
-      where: {
-        status: 'pending',
-        transactionHash: {
-          not: null,
-        },
-      },
-      take: 50, // Process up to 50 at a time to avoid overload
-    });
-
-    logger.debug(`Found ${pendingTips.length} pending tips to process`);
-
-    let confirmed = 0;
-    let failed = 0;
-
-    // Process each tip
-    for (const tip of pendingTips) {
-      if (tip.transactionHash) {
-        try {
-          const confirmationResult = await pollForTransactionConfirmation(
-            tip.transactionHash,
-            5, // Fewer attempts for background job (5 seconds)
-            500 // Shorter interval (500ms)
-          );
-
-          if (confirmationResult.confirmed && confirmationResult.result) {
-            // Atomic transition + earnings credit (see completeTipAtomically).
-            const credited = await transactionService.completeTipAtomically(tip);
-            if (credited) {
-              confirmed++;
-              logger.info(`Confirmed pending tip: ${tip.id}`);
-            }
-          } else {
-            // Check if too much time has passed (give up after 5 minutes)
-            const ageMs = Date.now() - tip.createdAt.getTime();
-            if (ageMs > 5 * 60 * 1000) {
-              // Mark as failed if over 5 minutes old
-              await transactionService.markTipAsFailed(tip.id);
-
-              failed++;
-              logger.warn(`Gave up on pending tip after 5 minutes: ${tip.id}`);
-            }
-          }
-        } catch (error) {
-          logger.error(`Error processing pending tip ${tip.id}:`, error);
-        }
-      }
-    }
-
-    logger.info(
-      `Finished processing pending tips: ${confirmed} confirmed, ${failed} failed, ${pendingTips.length - confirmed - failed} still pending`
-    );
-
-    return confirmed + failed;
-  } catch (error) {
-    logger.error('Failed to process pending tips:', error);
-    return 0;
-  }
-}
-
-/**
- * Initialize background job for processing pending tips
- * Sets up an interval to periodically process pending tips
- *
- * @param prisma Prisma client instance
- * @param intervalMs Interval between job executions in milliseconds (default 30000 = 30 seconds)
- * @returns Function to stop the background job
- */
-export function initializePendingTipsProcessor(
-  prisma: PrismaClient,
-  intervalMs: number = 30000
-): () => void {
-  logger.info(`Initializing pending tips processor (interval: ${intervalMs}ms)`);
-
-  const intervalId = setInterval(async () => {
-    try {
-      await processPendingTips(prisma);
-    } catch (error) {
-      logger.error('Error in pending tips processor:', error);
-    }
-  }, intervalMs);
-
-  // Return function to stop the job
-  return () => {
-    clearInterval(intervalId);
-    logger.info('Pending tips processor stopped');
-  };
 }

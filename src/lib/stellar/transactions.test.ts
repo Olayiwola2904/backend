@@ -35,7 +35,7 @@ describe('buildPaymentTransaction memo limit (#180)', () => {
     const transaction = await buildPaymentTransaction(payment(memo));
 
     expect(transaction.source).toBe(sender);
-    expect(transaction.memo.type).toBe((sdk) => sdk.MemoText);
+    expect(transaction.memo.type).toBe('memo');
     expect(Buffer.from(transaction.memo.value).toString('utf8')).toBe(memo);
   });
 
