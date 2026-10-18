@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, MemoText } from '@stellar/stellar-sdk';
 import { buildPaymentTransaction } from './transactions';
 import { MEMO_MAX_LENGTH } from './validation';
 
@@ -35,7 +35,7 @@ describe('buildPaymentTransaction memo limit (#180)', () => {
     const transaction = await buildPaymentTransaction(payment(memo));
 
     expect(transaction.source).toBe(sender);
-    expect(transaction.memo.type).toBe('memo.text');
+    expect(transaction.memo.type).toB(MemoText);
     expect(Buffer.from(transaction.memo.value).toString('utf8')).toBe(memo);
   });
 

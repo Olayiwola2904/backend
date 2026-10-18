@@ -17,16 +17,15 @@ import {
   InvalidCurrencyError,
   PaymentDeclinedError,
   PaymentNotFoundError,
-  PaymentRequiredError,
   ServiceUnavailableError,
 } from '../../utils/errors';
 import { buildPaymentTransaction, submitSignedTransaction } from '../../lib/stellar/transactions';
-import { getWalletBalance } from '../../lib/stellar/wallet';
 import { logger } from '../../utils/logger';
 import { sanitizePageSize, sanitizePageNumber, parseSortParameters } from '../../utils/pagination';
 import { paginateWithCursor } from '../../db/pagination';
 import { WebhookService } from '../webhooks/webhook.service';
 import { buildTipMemo, validateMemo, validatePaymentAmount } from '../../lib/stellar/validation';
+import { checkMinimumTipAmount, type TipCurrency } from '../../config/payment-limits';
 import { config } from '../../config/env';
 import { MAX_MEDIA_PER_TIP, type MediaView } from '../media/media.types';
 import { buildCdnUrl } from '../media/media.storage';
@@ -104,11 +103,12 @@ class OptimisticLockError extends Error {
 }
 
 export class PaymentService extends BaseService {
-  private readonly transactionService: TransactionService;
-
   constructor(private prisma: PrismaClient) {
     super();
-    this.transactionService = new TransactionService(prisma);
+  }
+
+  private get transactions(): TransactionService {
+    return new TransactionService(this.prisma);
   }
 
   /**
@@ -118,13 +118,25 @@ export class PaymentService extends BaseService {
    * - Creator exists and is public and verified
    * - Sender has a verified wallet
    */
-  async createTip(userId: string, data: CreateTipRequest): Promise<TipResponse> {
+  async createTip(userId: string, data: CreateTipRequest): Promise<TipResponse & { jobId?: string }> {
     return this.executeWithLogging('payment.createTip', async () => {
       // Validate amount at the service boundary as well, so callers that bypass
       // the route layer (jobs, internal tooling) cannot create bad records.
       const amountCheck = validatePaymentAmount(data.amount);
       if (!amountCheck.valid) {
         throw new ValidationError(amountCheck.reason || 'Amount must be greater than 0');
+      }
+
+      // #218 — Reject 0-value/dust tips below the per-currency minimum. Repeats
+      // the schema-level check so a caller that bypasses the route layer cannot
+      // create a sub-minimum tip either. The minimum and currency are included
+      // in the error so the caller knows exactly how much more is required.
+      const minimumCheck = checkMinimumTipAmount(data.amount, data.currency as TipCurrency | undefined);
+      if (!minimumCheck.valid) {
+        throw new ValidationError(
+          `Amount must be at least ${minimumCheck.minimum} ${minimumCheck.currency} (minimum tip amount)`,
+          { minimumAmount: minimumCheck.minimum, currency: minimumCheck.currency }
+        );
       }
 
       // Verify creator exists, is public, and is verified
@@ -231,40 +243,17 @@ export class PaymentService extends BaseService {
         }
       }
 
-      // #175 — Check on-chain balance before creating any DB record
+      // #221 — Tip creation is asynchronous: the on-chain balance check (a
+      // Stellar Horizon RPC call that can be slow or time out under network
+      // congestion) is no longer made on this request path. The tip is
+      // created immediately in PENDING state below, and a queued job
+      // (`balanceVerificationQueue`, handled by
+      // `lib/workers/balance-verification.worker.ts`) verifies the balance
+      // afterwards, transitioning the tip to FAILED if funds are insufficient
+      // or the check cannot be completed. `assetCode` is still resolved here
+      // (not a network call) so it can be persisted on the tip and forwarded
+      // to the job.
       const assetCode = requestedAsset?.code ?? 'USDC';
-      let walletBalances: { lumens: string; usdc?: string };
-      try {
-        walletBalances = await getWalletBalance(wallet.publicKey);
-      } catch (err) {
-        logger.error(
-          { userId, walletPublicKey: wallet.publicKey, failureReason: 'balance_check_failed' },
-          'Tip blocked: failed to fetch on-chain wallet balance'
-        );
-        throw new ServiceUnavailableError('Unable to verify wallet balance at this time');
-      }
-
-      const rawBalance =
-        assetCode === 'USDC' ? (walletBalances.usdc ?? '0') : walletBalances.lumens;
-      const currentBalance = parseFloat(rawBalance);
-      if (!Number.isFinite(currentBalance) || currentBalance < data.amount) {
-        logger.warn(
-          {
-            userId,
-            walletPublicKey: wallet.publicKey,
-            requiredAmount: data.amount,
-            currentBalance,
-            currency: assetCode,
-            failureReason: 'insufficient_balance',
-          },
-          'Tip blocked: insufficient on-chain balance'
-        );
-        throw new PaymentRequiredError('Insufficient funds to complete the payment', {
-          requiredAmount: data.amount,
-          currentBalance,
-          currency: assetCode,
-        });
-      }
 
       // Validate requested media (#64) before creating the tip: every id must be
       // media this user uploaded, finished scanning, and has not already attached.
@@ -286,11 +275,8 @@ export class PaymentService extends BaseService {
       // Create tip in pending state
       let tip;
       try {
-        // Tip creation is a single atomic write; media attachment bookkeeping is
-        // stamped separately below (best-effort) so it never blocks the tip.
-        tip = await this.transactionService.runTipCreation(async (tx) => {
-          return tx.tip.create({
-            data: {
+        tip = await this.prisma.tip.create({
+          data: {
             fromUserId: userId,
             creatorId: data.creatorId,
             amount: data.amount,
@@ -304,8 +290,7 @@ export class PaymentService extends BaseService {
             ...(attachableMedia.length
               ? { media: { connect: attachableMedia.map((media) => ({ id: media.id })) } }
               : {}),
-            },
-          });
+          },
         });
       } catch (error) {
         // Lost a concurrent create race on the same key: replay the winner.
@@ -343,7 +328,43 @@ export class PaymentService extends BaseService {
         logger.info(`Tip ${tip.id} attached ${attachableMedia.length} media item(s)`);
       }
 
-      return this.formatTipResponse(tip);
+      // #221 — Enqueue the balance verification job now that the tip exists.
+      // Imported lazily, same reasoning as `checkTransactionConfirmation`
+      // below: importing the queue module opens a Redis connection as a side
+      // effect, which unit tests that import the service must not trigger.
+      let jobId: string | undefined;
+      try {
+        const { balanceVerificationQueue } = await import('../../lib/queue');
+        const job = await balanceVerificationQueue.add(
+          'verify-balance',
+          withJobTracePayload(
+            {
+              tipId: tip.id,
+              walletPublicKey: wallet.publicKey,
+              assetCode,
+              requiredAmount: tip.amount,
+            },
+            { userId }
+          ),
+          {
+            attempts: 5,
+            backoff: { type: 'exponential', delay: 2000 },
+          }
+        );
+        jobId = String(job.id);
+      } catch (error) {
+        // The tip already exists and is authoritative; a failure to enqueue
+        // verification is logged, not surfaced, so a Redis hiccup never turns
+        // into a failed tip creation request (the exact failure mode #221
+        // exists to remove). The tip is left PENDING; an operational sweep or
+        // manual retry can re-enqueue verification for it later.
+        logger.error(
+          { tipId: tip.id, error },
+          'Failed to enqueue balance verification job; tip remains PENDING unverified'
+        );
+      }
+
+      return { ...this.formatTipResponse(tip), jobId };
     });
   }
 
@@ -874,7 +895,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactionService.runTipStatusTransition(async (tx) => {
+          finalTip = await this.transactions.runTipStatusTransition(async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -1152,15 +1173,13 @@ export class PaymentService extends BaseService {
       }
 
       try {
-        const updatedTip = await this.transactionService.runTransactionHashPersist(async (tx) => {
-          return tx.tip.update({
-            where: { id: tipId },
-            data: {
-              transactionHash: result.transactionHash,
-            },
-            select: { status: true },
-          });
-        });
+        const updatedTip = await this.transactions.runTipTransactionHashUpdate(async (tx) => tx.tip.update({
+          where: { id: tipId },
+          data: {
+            transactionHash: result.transactionHash,
+          },
+          select: { status: true },
+        }));
 
         logger.info(
           `Payment transaction submitted for tip: ${tipId}, hash: ${result.transactionHash}`
@@ -1328,11 +1347,11 @@ export class PaymentService extends BaseService {
         }
 
         if (outcome === 'success') {
-          return this.transactionService.confirmTipCompletion(tipId, (id, req) => this.updateTipStatus(id, req));
+          return this.transactions.runTipConfirmation(tipId, TipStatus.COMPLETED, (id, data) => this.updateTipStatus(id, data));
         }
 
         if (outcome === 'failed') {
-          return this.transactionService.failTip(tipId, (id, req) => this.updateTipStatus(id, req));
+          return this.transactions.runTipConfirmation(tipId, TipStatus.FAILED, (id, data) => this.updateTipStatus(id, data));
         }
 
         // Still pending: back off and poll again.

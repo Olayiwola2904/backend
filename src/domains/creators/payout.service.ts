@@ -7,14 +7,14 @@ import { getStellarClient } from '../../lib/stellar/client';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { config } from '../../config/env';
 import { invalidateCaches, earningsCacheKey, creatorCacheKeys } from '../../lib/cache/invalidation';
-import { TransactionService } from '../../services/transaction.service';
+import { TransactionService, createTransactionService } from '../../services/transaction.service';
 
 export class PayoutService extends BaseService {
   private readonly txService: TransactionService;
 
   constructor(private prisma: PrismaClient) {
     super();
-    this.txService = new TransactionService(prisma);
+    this.txService = createTransactionService(prisma);
   }
 
   /**
@@ -61,7 +61,8 @@ export class PayoutService extends BaseService {
         );
       }
 
-      // Create payout record through the consolidated transaction service
+      // Create payout record via the transaction service so it is atomic
+      // with any future side writes added to this operation.
       const payout = await this.txService.createPayoutRecord({
         creatorId,
         amount: data.amount,
@@ -105,8 +106,13 @@ export class PayoutService extends BaseService {
         return;
       }
 
-      // Update status to processing via transaction service
-      await this.txService.markPayoutProcessing(payoutId);
+      // Transition pending -> processing atomically; a concurrent worker
+      // that won the race makes this a no-op.
+      const claimed = await this.txService.markPayoutProcessing(payoutId);
+      if (!claimed) {
+        logger.warn(`Payout ${payoutId} was already claimed by another worker`);
+        return;
+      }
 
       try {
         const stellarClient = getStellarClient();
@@ -150,13 +156,13 @@ export class PayoutService extends BaseService {
 
         logger.info(`Payout transaction submitted successfully: ${result.id}`);
 
-        // Atomically complete payout and decrement creator's pending balance
-        await this.txService.completePayout({
-          payoutId,
-          creatorId: payout.creatorId,
-          amount: payout.amount,
-          transactionHash: result.id,
-        });
+        // Atomically mark completed and decrement the creator's pending
+        // balance in a single transaction.
+        const completion = await this.txService.completePayout(payoutId, result.id);
+        if (!completion) {
+          logger.warn(`Payout ${payoutId} completion was already recorded; skipping credit`);
+          return;
+        }
 
         logger.info(`Payout completed for creator ${payout.creatorId}: ${payout.amount} XLM`);
         await invalidateCaches(
@@ -170,12 +176,12 @@ export class PayoutService extends BaseService {
       } catch (error: any) {
         logger.error(`Payout transaction failed for ${payoutId}:`, error);
 
-        // Update payout status to failed with error message via transaction service
-        await this.txService.failPayout({
+        // Mark failed with retry bookkeeping atomically.
+        await this.txService.failPayout(
           payoutId,
-          errorMessage: error.message || 'Unknown error',
-          nextRetryAt: this.calculateNextRetry(payout.retryCount + 1),
-        });
+          error.message || 'Unknown error',
+          this.calculateNextRetry(payout.retryCount + 1)
+        );
 
         throw error;
       }
@@ -204,24 +210,22 @@ export class PayoutService extends BaseService {
         },
       });
 
-      for (const webhook of webhooks) {
+      const matchingWebhookIds = webhooks.filter((webhook) => {
         const events = webhook.events as string[];
-        if (events.includes('payout.completed')) {
-          await this.prisma.webhookEvent.create({
-            data: {
-              webhookId: webhook.id,
-              eventType: 'payout.completed',
-              payload: JSON.stringify({
-                payoutId: payout.id,
-                amount: payout.amount,
-                transactionHash,
-                walletAddress: payout.walletAddress,
-                timestamp: new Date().toISOString(),
-              }),
-              status: 'pending',
-            },
-          });
-        }
+        return events.includes('payout.completed');
+      }).map((webhook) => webhook.id);
+
+      if (matchingWebhookIds.length > 0) {
+        const payload = JSON.stringify({
+          payoutId: payout.id,
+          amount: payout.amount,
+          transactionHash,
+          walletAddress: payout.walletAddress,
+          timestamp: new Date().toISOString(),
+        });
+
+        // Persist all webhook events in a single transaction.
+        await this.txService.recordPayoutWebhookEvents(matchingWebhookIds, payload);
       }
 
       logger.info(`Webhook events dispatched for payout ${payout.id}`);
@@ -381,13 +385,8 @@ export class PayoutService extends BaseService {
           isPublic: creator.isPublic,
         },
         totalTips,
-        paidOut,
         recentTips: recentTips.map((tip) => ({
-          id: tip.id,
-          amount: tip.amount,
-          status: tip.status,
-          createdAt: tip.createdAt.toISOString(),
-          fromUserName: tip.fromUser ? tip.fromUser.name : null,
+          id: tip.id
         })),
       };
     });
