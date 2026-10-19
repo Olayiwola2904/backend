@@ -1,6 +1,5 @@
 import { PrismaClient, Tip } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
-import { TransactionService } from '../../services/transaction.service';
 import {
   CreateTipRequest,
   UpdateTipStatusRequest,
@@ -21,6 +20,7 @@ import {
 } from '../../utils/errors';
 import { buildPaymentTransaction, submitSignedTransaction } from '../../lib/stellar/transactions';
 import { logger } from '../../utils/logger';
+import { transactionRetryCounter } from '../../lib/metrics';
 import { sanitizePageSize, sanitizePageNumber, parseSortParameters } from '../../utils/pagination';
 import { paginateWithCursor } from '../../db/pagination';
 import { WebhookService } from '../webhooks/webhook.service';
@@ -31,8 +31,11 @@ import { MAX_MEDIA_PER_TIP, type MediaView } from '../media/media.types';
 import { buildCdnUrl } from '../media/media.storage';
 import { TIP_VISIBLE_STATE } from '../moderation/moderation.types';
 import { TipFilterInput, buildTipWhere, describeTipFilters } from './tip-filters';
+import { formatInTimezone } from '../../utils/timezone';
 import { invalidateCaches, tipCacheKeys } from '../../lib/cache/invalidation';
 import { withJobTracePayload } from '../../lib/requestContext';
+import { validateWhitelistedAsset } from './payment.schemas';
+import { TransactionService } from '../../services/transaction.service';
 /**
 
  * Columns required to build a TipResponse.
@@ -107,6 +110,9 @@ export class PaymentService extends BaseService {
 
   constructor(private prisma: PrismaClient) {
     super();
+    // All payment state mutations are routed through the transaction service so
+    // related writes share a single, named transaction instead of nesting
+    // `$transaction` calls across service layers.
     this.transactions = new TransactionService(prisma);
   }
 
@@ -154,6 +160,10 @@ export class PaymentService extends BaseService {
 
       if (!creator.verified) {
         throw new ValidationError('Creator account must be verified to receive tips');
+      }
+
+      if (data.assetCode || data.assetIssuer) {
+        await validateWhitelistedAsset(data.assetCode || 'USDC', data.assetIssuer, this.prisma);
       }
 
       const requestedAsset = data.assetId
@@ -289,7 +299,7 @@ export class PaymentService extends BaseService {
             ...(attachableMedia.length
               ? { media: { connect: attachableMedia.map((media) => ({ id: media.id })) } }
               : {}),
-          },
+          } as any,
         });
       } catch (error) {
         // Lost a concurrent create race on the same key: replay the winner.
@@ -496,7 +506,7 @@ export class PaymentService extends BaseService {
       const totalPages = Math.ceil(total / safePageSize);
 
       return {
-        tips: tips.map((tip) => this.formatTipResponse(tip)),
+        tips: tips.map((tip) => this.formatTipResponse(tip, options.timezone)),
         total,
         page: safePage,
         pageSize: safePageSize,
@@ -551,8 +561,8 @@ export class PaymentService extends BaseService {
 
       return {
         ...result,
-        items: result.items.map((tip) => this.formatTipResponse(tip)),
-        data: result.data.map((tip) => this.formatTipResponse(tip)),
+        items: result.items.map((tip) => this.formatTipResponse(tip, params.timezone)),
+        data: result.data.map((tip) => this.formatTipResponse(tip, params.timezone)),
         filters: describeTipFilters(params),
       };
     });
@@ -611,7 +621,7 @@ export class PaymentService extends BaseService {
       const totalPages = Math.ceil(total / safePageSize);
 
       return {
-        tips: tips.map((tip) => this.formatTipResponse(tip)),
+        tips: tips.map((tip) => this.formatTipResponse(tip, options.timezone)),
         total,
         page: safePage,
         pageSize: safePageSize,
@@ -658,8 +668,8 @@ export class PaymentService extends BaseService {
 
       return {
         ...result,
-        items: result.items.map((tip) => this.formatTipResponse(tip)),
-        data: result.data.map((tip) => this.formatTipResponse(tip)),
+        items: result.items.map((tip) => this.formatTipResponse(tip, params.timezone)),
+        data: result.data.map((tip) => this.formatTipResponse(tip, params.timezone)),
         filters: describeTipFilters(params),
       };
     });
@@ -722,7 +732,7 @@ export class PaymentService extends BaseService {
       const totalPages = Math.ceil(total / safePageSize);
 
       return {
-        tips: tips.map((tip) => this.formatTipResponse(tip)),
+        tips: tips.map((tip) => this.formatTipResponse(tip, options.timezone)),
         total,
         page: safePage,
         pageSize: safePageSize,
@@ -894,7 +904,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactions.updateTipStatusWithEarnings(tipId, async (tx) => {
+          finalTip = await this.transactions.updateTipStatus(tipId, data.status, async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -974,6 +984,10 @@ export class PaymentService extends BaseService {
             error instanceof OptimisticLockError || code === 'P2028' || code === 'P2034';
 
           if (retryable && attempt < maxRetries) {
+            transactionRetryCounter.inc({
+              operation: 'payment.updateTipStatus',
+              reason: error instanceof OptimisticLockError ? 'optimistic_lock' : code === 'P2034' ? 'serialization_failure' : 'deadlock',
+            });
             logger.warn(
               { tipId, attempt, maxRetries },
               'Concurrent tip update detected; retrying with fresh state'
@@ -1066,6 +1080,9 @@ export class PaymentService extends BaseService {
           field: 'memo',
         });
       }
+
+      // Validate asset code and issuer against configured whitelisted assets (#185)
+      await validateWhitelistedAsset(assetCode || 'USDC', assetIssuer, this.prisma);
 
       const tip = await this.prisma.tip.findUnique({
         where: { id: tipId },
@@ -1346,11 +1363,11 @@ export class PaymentService extends BaseService {
         }
 
         if (outcome === 'success') {
-          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
+          return this.transactions.confirmTip(tipId);
         }
 
         if (outcome === 'failed') {
-          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
+          return this.transactions.failTip(tipId);
         }
 
         // Still pending: back off and poll again.
@@ -1375,21 +1392,24 @@ export class PaymentService extends BaseService {
   /**
    * Format database tip record to response DTO
    */
-  private formatTipResponse(tip: {
-    id: string;
-    fromUserId: string;
-    creatorId: string;
-    amount: number;
-    message: string | null;
-    status: string;
-    transactionHash?: string | null;
-    createdAt: Date;
-    updatedAt: Date;
-    media?: any[];
-    assetCode?: string | null;
-    assetIssuer?: string | null;
-    assetDecimals?: number | null;
-  }): TipResponse {
+  private formatTipResponse(
+    tip: {
+      id: string;
+      fromUserId: string;
+      creatorId: string;
+      amount: number;
+      message: string | null;
+      status: string;
+      transactionHash?: string | null;
+      createdAt: Date;
+      updatedAt: Date;
+      media?: any[];
+      assetCode?: string | null;
+      assetIssuer?: string | null;
+      assetDecimals?: number | null;
+    },
+    timezone?: string
+  ): TipResponse {
     return {
       id: tip.id,
       fromUserId: tip.fromUserId,
@@ -1401,8 +1421,11 @@ export class PaymentService extends BaseService {
       media: Array.isArray(tip.media)
         ? tip.media.map((row: any) => this.formatAttachedMedia(row))
         : [],
-      createdAt: tip.createdAt.toISOString(),
-      updatedAt: tip.updatedAt.toISOString(),
+      // Formatted in the caller's requested timezone when listing/filtering
+      // by date range (issue #216); every other call site omits `timezone`
+      // and gets the previous plain-UTC ISO string, unchanged.
+      createdAt: formatInTimezone(tip.createdAt, timezone),
+      updatedAt: formatInTimezone(tip.updatedAt, timezone),
       assetCode: tip.assetCode ?? 'USDC',
       assetIssuer: tip.assetIssuer ?? null,
       assetDecimals: tip.assetDecimals ?? 7,
