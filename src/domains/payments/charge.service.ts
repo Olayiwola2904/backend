@@ -126,7 +126,7 @@ export class ChargeService extends BaseService {
         {
           type: PAYMENT_EVENT_TYPES.CREATED,
           actorId: userId,
-          payload: {
+          data: {
             provider: this.provider.name,
             providerRef: intent.providerRef,
             amount: input.amount,
@@ -253,11 +253,11 @@ export class ChargeService extends BaseService {
           status: providerRefund.status,
           providerRef: providerRefund.providerRef,
         },
-        shouldUpdateStatus ? nextStatus : undefined,
+        shouldUpdateStatus ? nextStatus : null,
         {
           type: PAYMENT_EVENT_TYPES.REFUND_CREATED,
           actorId: userId,
-          payload: {
+          data: {
             refundId: undefined,
             amount,
             currency: payment.currency,
@@ -277,83 +277,55 @@ export class ChargeService extends BaseService {
    * before any state change and duplicate deliveries are ignored via the unique
    * provider event id.
    */
-  async handleWebhook(providerName: string, payload: unknown, signature: string): Promise<WebhookResult> {
+  async handleWebhook(providerName: string, rawBody: string, signature: string): Promise<WebhookResult> {
     return this.executeWithLogging('payments.webhook', async () => {
       if (providerName !== this.provider.name) {
-        throw new ValidationError(`Unsupported payment provider "${providerName}"`);
+        throw new ValidationError(`Unsupported provider "${providerName}"`);
+      }
+      if (!this.webhookSecret) {
+        throw new AppError('Webhook secret is not configured', 500);
       }
 
-      const secret = this.webhookSecret;
-      if (!secret) {
-        throw new AppError('Webhook secret is not configured', 500, 'WEBHOOK_SECRET_MISSING');
-      }
-
-      const verification = verifyWebhookSignature({
-        payload,
+      const verified = verifyWebhookSignature({
+        rawBody,
         signature,
-        secret,
+        secret: this.webhookSecret,
         toleranceSeconds: this.webhookToleranceSeconds,
       });
-      if (!verification.valid) {
-        logger.warn({ providerName, reason: verification.reason, failureReason: 'invalid_webhook_signature' }, 'Webhook rejected: invalid signature');
+      if (!verified) {
         throw new UnauthorizedError('Invalid webhook signature');
       }
 
-      const event = this.parseWebhookEvent(payload);
-      const existing = await this.prisma.paymentEvent.findFirst({
-        where: { providerEventId: event.eventId },
-      });
+      const event = this.provider.parseWebhookEvent(rawBody);
+      const existing = await this.prisma.paymentEvent.findFirst({ where: { providerEventId: event.id } });
       if (existing) {
-        return { received: true, duplicate: true, paymentId: existing.paymentId };
+        return { received: true, duplicate: true };
       }
 
-      const payment = await this.prisma.payment.findFirst({
-        where: { providerRef: event.providerRef, provider: this.provider.name },
-      });
+      const payment = await this.prisma.payment.findUnique({ where: { providerRef: event.providerRef } });
       if (!payment) {
         throw new PaymentNotFoundError('Payment for webhook event not found');
       }
 
-      const transition = transitionForWebhookEvent(payment.status as PaymentStatus, event.type);
-      const nextStatus = transition && canTransition(payment.status as PaymentStatus, transition) ? transition : undefined;
+      const nextStatus = transitionForWebhookEvent(payment.status as PaymentStatus, event.type);
+      if (!nextStatus) {
+        logger.warn({ paymentId: payment.id, eventType: event.type, currentStatus: payment.status }, 'Webhook event ignored: no valid transition');
+        return { received: true, duplicate: false };
+      }
 
-      await this.transactions.recordWebhookEvent(
-        payment.id,
-        nextStatus,
-        {
-          type: event.type,
-          actorId: null,
-          payload: {
-            providerEventId: event.eventId,
-            providerRef: event.providerRef,
-            previousStatus: payment.status,
-            nextStatus: nextStatus ?? payment.status,
-          },
-        }
-      );
+      await this.transactions.applyWebhookTransition(payment.id, nextStatus, {
+        type: PAYMENT_EVENT_TYPES.STATUS_CHANGED,
+        actorId: null,
+        providerEventId: event.id,
+        data: { eventType: event.type, from: payment.status, to: nextStatus },
+      });
 
-      return { received: true, duplicate: false, paymentId: payment.id };
+      return { received: true, duplicate: false };
     });
   }
 
-  private parseWebhookEvent(payload: unknown): { eventId: string; providerRef: string; type: string } {
-    if (!payload || typeof payload !== 'object') {
-      throw new ValidationError('Webhook payload must be an object');
-    }
-    const record = payload as Record<string, unknown>;
-    const eventId = record.id;
-    const providerRef = record.providerRef ?? record.paymentIntentId;
-    const type = record.type;
-    if (typeof eventId !== 'string' || typeof providerRef !== 'string' || typeof type !== 'string') {
-      throw new ValidationError('Webhook payload is missing required fields');
-    }
-    return { eventId, providerRef: providerRef as string, type: type as string };
-  }
-
   private sumRefunded(refunds: Array<{ amount: number; status: string }>): number {
-    return refunds
-      .filter((zefund) => refund.status === 'succeeded')
-      .reduce((sum, refund) => sum + refund.amount, 0);
+    return refunds.reduce((total, refund) => (refund.status === 'succeeded' ? total + refund.amount : total), 0);
   }
 
   private toResponse(payment: Prisma.PaymentGetPayload<{ refunds: true }>): PaymentResponse {
@@ -368,9 +340,9 @@ export class ChargeService extends BaseService {
       currency: payment.currency,
       status: payment.status as PaymentStatus,
       description: payment.description,
+      createdAt: payment.createdAt.toISOString(),
+      updatedAt: payment.updatedAt.toISOString(),
       refunds: (payment.refunds ?? []).map((refund) => this.toRefundResponse(refund)),
-      createdAt: payment.createdAt,
-      updatedAt: payment.updatedAt,
     };
   }
 
@@ -383,7 +355,7 @@ export class ChargeService extends BaseService {
       reason: refund.reason,
       status: refund.status,
       providerRef: refund.providerRef,
-      createdAt: refund.createdAt,
+      createdAt: refund.createdAt.toISOString(),
     };
   }
 }
