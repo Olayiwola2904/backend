@@ -1,4 +1,4 @@
-import { PrismaClient, Tip } from '@prisma/client';
+import { Prisma, PrismaClient, Tip } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import {
   CreateTipRequest,
@@ -36,7 +36,6 @@ import { invalidateCaches, tipCacheKeys } from '../../lib/cache/invalidation';
 import { withJobTracePayload } from '../../lib/requestContext';
 import { validateWhitelistedAsset } from './payment.schemas';
 import { TransactionService } from '../../services/transaction.service';
-import { OptimisticLockError } from '../../services/transaction.service';
 /**
 
  * Columns required to build a TipResponse.
@@ -99,9 +98,20 @@ function isUniqueConstraintError(error: unknown): boolean {
  */
 const VISIBLE_TIPS_ONLY = { moderationState: TIP_VISIBLE_STATE } as const;
 
+class OptimisticLockError extends Error {
+  constructor(public readonly tipId: string) {
+    super(`Optimistic lock conflict for tip ${tipId}`);
+    this.name = 'OptimisticLockError';
+  }
+}
+
 export class PaymentService extends BaseService {
   constructor(private prisma: PrismaClient) {
     super();
+  }
+
+  private get transactions(): TransactionService {
+    return new TransactionService(this.prisma);
   }
 
   /**
@@ -113,7 +123,6 @@ export class PaymentService extends BaseService {
    */
   async createTip(userId: string, data: CreateTipRequest): Promise<TipResponse & { jobId?: string }> {
     return this.executeWithLogging('payment.createTip', async () => {
-      const transactionService = new TransactionService(this.prisma);
       // Validate amount at the service boundary as well, so callers that bypass
       // the route layer (jobs, internal tooling) cannot create bad records.
       const amountCheck = validatePaymentAmount(data.amount);
@@ -273,7 +282,7 @@ export class PaymentService extends BaseService {
       // Create tip in pending state
       let tip;
       try {
-        tip = await transactionService.createTip({
+        tip = await this.transactions.createTip({
           data: {
             fromUserId: userId,
             creatorId: data.creatorId,
@@ -319,7 +328,7 @@ export class PaymentService extends BaseService {
         // Stamp `attachedAt` so the media is ordered and the prune sweep can tell
         // an attached upload from an abandoned one. Best-effort: the tip exists
         // and is authoritative even if this bookkeeping write fails.
-        await transactionService.stampMediaAttached(
+        await this.stampMediaAttached(
           tip.id,
           attachableMedia.map((media) => media.id)
         );
@@ -385,6 +394,24 @@ export class PaymentService extends BaseService {
     });
 
     return Array.isArray(rows) ? rows : [];
+  }
+
+  /**
+   * Record when media became part of a tip. Best-effort bookkeeping; failures are
+   * logged rather than surfaced because the tip itself is already committed.
+   */
+  private async stampMediaAttached(tipId: string, mediaIds: string[]): Promise<void> {
+    const tipMedia = (this.prisma as unknown as { tipMedia?: any }).tipMedia;
+    if (!tipMedia?.updateMany) return;
+
+    try {
+      await tipMedia.updateMany({
+        where: { id: { in: mediaIds }, tipId },
+        data: { attachedAt: new Date() },
+      });
+    } catch (error) {
+      logger.warn(`Failed to stamp attachedAt for tip ${tipId}: ${(error as Error).message}`);
+    }
   }
 
   /**
@@ -868,7 +895,6 @@ export class PaymentService extends BaseService {
    */
   async updateTipStatus(tipId: string, data: UpdateTipStatusRequest): Promise<TipResponse> {
     return this.executeWithLogging('payment.updateTipStatus', async () => {
-      const transactionService = new TransactionService(this.prisma);
       const maxRetries = 3;
       let attempt = 0;
       let shouldDispatchWebhook = false;
@@ -876,7 +902,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await transactionService.runTipStatusTransition(async (tx) => {
+          finalTip = await this.transactions.updateTipStatus(tipId, data.status, async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -953,12 +979,12 @@ export class PaymentService extends BaseService {
           attempt++;
           const code = (error as { code?: string })?.code;
           const retryable =
-            transactionService.isOptimisticLockError(error) || code === 'P2028' || code === 'P2034';
+            error instanceof OptimisticLockError || code === 'P2028' || code === 'P2034';
 
           if (retryable && attempt < maxRetries) {
             transactionRetryCounter.inc({
               operation: 'payment.updateTipStatus',
-              reason: transactionService.isOptimisticLockError(error) ? 'optimistic_lock' : code === 'P2034' ? 'serialization_failure' : 'deadlock',
+              reason: error instanceof OptimisticLockError ? 'optimistic_lock' : code === 'P2034' ? 'serialization_failure' : 'deadlock',
             });
             logger.warn(
               { tipId, attempt, maxRetries },
@@ -968,7 +994,7 @@ export class PaymentService extends BaseService {
             continue;
           }
 
-          if (transactionService.isOptimisticLockError(error)) {
+          if (error instanceof OptimisticLockError) {
             throw new ConflictError('Tip was updated concurrently; reload and retry', {
               tipId,
               hint: 'Fetch the tip again and retry the transition with the current state.',
@@ -1119,7 +1145,6 @@ export class PaymentService extends BaseService {
     transactionEnvelope: string
   ): Promise<SubmitTransactionResponse> {
     return this.executeWithLogging('payment.submitTransaction', async () => {
-      const transactionService = new TransactionService(this.prisma);
       const tip = await this.prisma.tip.findUnique({
         where: { id: tipId },
         select: { id: true, status: true, transactionHash: true },
@@ -1162,7 +1187,7 @@ export class PaymentService extends BaseService {
       }
 
       try {
-        const updatedTip = await transactionService.recordTransactionHash({
+        const updatedTip = await this.transactions.recordTransactionHash({
           where: { id: tipId },
           data: {
             transactionHash: result.transactionHash,
@@ -1279,7 +1304,6 @@ export class PaymentService extends BaseService {
     } = {}
   ): Promise<TipResponse> {
     return this.executeWithLogging('payment.confirmTransaction', async () => {
-      const transactionService = new TransactionService(this.prisma);
       const maxAttempts = options.maxAttempts ?? 3;
       const baseDelayMs = options.baseDelayMs ?? 10;
 
@@ -1337,11 +1361,11 @@ export class PaymentService extends BaseService {
         }
 
         if (outcome === 'success') {
-          return transactionService.confirmTip(tipId, TipStatus.COMPLETED, (id, status) => this.updateTipStatus(id, { status }));
+          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
         }
 
         if (outcome === 'failed') {
-          return transactionService.confirmTip(tipId, TipStatus.FAILED, (id, status) => this.updateTipStatus(id, { status }));
+          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
         }
 
         // Still pending: back off and poll again.

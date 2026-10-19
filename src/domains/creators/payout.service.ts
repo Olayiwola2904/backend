@@ -7,14 +7,14 @@ import { getStellarClient } from '../../lib/stellar/client';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { config } from '../../config/env';
 import { invalidateCaches, earningsCacheKey, creatorCacheKeys } from '../../lib/cache/invalidation';
-import { TransactionService } from '../../services/transaction.service';
+import { TransactionService, createTransactionService } from '../../services/transaction.service';
 
 export class PayoutService extends BaseService {
-  private readonly txService: TransactionService;
+  private readonly transactions: TransactionService;
 
   constructor(private prisma: PrismaClient) {
     super();
-    this.txService = new TransactionService(prisma);
+    this.transactions = createTransactionService(prisma);
   }
 
   /**
@@ -61,11 +61,14 @@ export class PayoutService extends BaseService {
         );
       }
 
-      // Create payout record within a named transaction
-      const payout = await this.txService.createPayoutRecord({
-        creatorId,
-        amount: data.amount,
-        walletAddress: wallet.publicKey,
+      // Create payout record
+      const payout = await this.prisma.payout.create({
+        data: {
+          creatorId,
+          amount: data.amount,
+          status: 'pending' as any,
+          walletAddress: wallet.publicKey,
+        },
       });
 
       logger.info(`Payout request created for creator ${creatorId}: ${data.amount} to ${wallet.publicKey}`);
@@ -105,8 +108,8 @@ export class PayoutService extends BaseService {
         return;
       }
 
-      // Update status to processing via transaction service
-      await this.txService.markPayoutProcessing(payoutId);
+      // Update status to processing via the transaction service
+      await this.transactions.markPayoutProcessing(payoutId);
 
       try {
         const stellarClient = getStellarClient();
@@ -150,12 +153,15 @@ export class PayoutService extends BaseService {
 
         logger.info(`Payout transaction submitted successfully: ${result.id}`);
 
-        // Atomically complete payout and decrement pending balance
-        await this.txService.completePayout(payoutId, payout.creatorId, payout.amount, result.id);
+        // Atomically mark payout completed and decrement creator's pending balance
+        const completed = await this.transactions.completePayout({
+          payoutId,
+          transactionHash: result.id,
+        });
 
-        logger.info(`Payout completed for creator ${payout.creatorId}: ${payout.amount} XLM`);
+        logger.info(`Payout completed for creator ${completed.creatorId}: ${completed.amount} XLM`);
         await invalidateCaches(
-          [earningsCacheKey(payout.creatorId), ...creatorCacheKeys(payout.creatorId)],
+          [earningsCacheKey(completed.creatorId), ...creatorCacheKeys(completed.creatorId)],
           'payout.executed'
         );
 
@@ -165,12 +171,12 @@ export class PayoutService extends BaseService {
       } catch (error: any) {
         logger.error(`Payout transaction failed for ${payoutId}:`, error);
 
-        // Update payout status to failed with error message via transaction service
-        await this.txService.failPayout(
+        // Atomically mark payout failed with retry bookkeeping
+        await this.transactions.failPayout({
           payoutId,
-          error.message || 'Unknown error',
-          this.calculateNextRetry(payout.retryCount + 1)
-        );
+          errorMessage: error.message || 'Unknown error',
+          nextRetryAt: this.calculateNextRetry(payout.retryCount + 1),
+        });
 
         throw error;
       }
@@ -249,7 +255,6 @@ export class PayoutService extends BaseService {
 
       for (const payout of failedPayouts) {
         try {
-          await this.txService.resetPayoutForRetry(payout.id);
           await this.executePayoutTransaction(payout.id);
         } catch (error) {
           logger.error(`Failed to retry payout ${payout.id}:`, error);

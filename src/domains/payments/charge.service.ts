@@ -109,32 +109,27 @@ export class ChargeService extends BaseService {
         { ...this.retry, shouldRetry: (error) => isRetryableProviderError(error) }
       );
 
-      const payment = await this.transactions.runInPaymentTransaction(async (tx) => {
-        const created = await tx.payment.create({
-          data: {
-            idempotencyKey,
-            userId,
-            creatorId: input.creatorId ?? null,
-            provider: this.provider.name,
-            providerRef: intent.providerRef,
-            method: input.method,
-            amount: input.amount,
-            currency: input.currency,
-            status: intent.status,
-            description: input.description ?? null,
-          },
-          include: { refunds: true },
-        });
-
-        await this.recordEventInTransaction(tx, created.id, PAYMENT_EVENT_TYPES.CREATED, userId, {
+      // Persist the payment and its creation event atomically via the transaction service.
+      const payment = await this.transactions.createPaymentWithEvent({
+        idempotencyKey,
+        userId,
+        creatorId: input.creatorId ?? null,
+        provider: this.provider.name,
+        providerRef: intent.providerRef,
+        method: input.method,
+        amount: input.amount,
+        currency: input.currency,
+        status: intent.status,
+        description: input.description ?? null,
+        eventType: PAYMENT_EVENT_TYPES.CREATED,
+        eventPayload: {
           provider: this.provider.name,
           providerRef: intent.providerRef,
           amount: input.amount,
           currency: input.currency,
           method: input.method,
-        });
-
-        return created;
+        },
+        actorId: userId,
       });
 
       logger.info({ paymentId: payment.id, provider: this.provider.name }, 'Payment created');
@@ -239,33 +234,28 @@ export class ChargeService extends BaseService {
         { ...this.retry, shouldRetry: (error) => isRetryableProviderError(error) }
       );
 
-      const { refund } = await this.transactions.runInPaymentTransaction(async (tx) => {
-        const createdRefund = await tx.refund.create({
-          data: {
-            paymentId: payment.id,
-            idempotencyKey,
-            amount,
-            currency: payment.currency,
-            reason: input.reason ?? null,
-            status: providerRefund.status,
-            providerRef: providerRefund.providerRef,
-          },
-        });
+      const totalRefunded = alreadyRefunded + (providerRefund.status === 'succeeded' ? amount : 0);
+      const nextStatus: PaymentStatus = totalRefunded >= payment.amount ? 'refunded' : 'partially_refunded';
+      const shouldTransition = providerRefund.status === 'succeeded' && canTransition(payment.status as PaymentStatus, nextStatus);
 
-        const totalRefunded = alreadyRefunded + (providerRefund.status === 'succeeded' ? amount : 0);
-        const nextStatus: PaymentStatus = totalRefunded >= payment.amount ? 'refunded' : 'partially_refunded';
-        if (providerRefund.status === 'succeeded' && canTransition(payment.status as PaymentStatus, nextStatus)) {
-          await tx.payment.update({ where: { id: payment.id }, data: { status: nextStatus } });
-        }
-
-        await this.recordEventInTransaction(tx, payment.id, PAYMENT_EVENT_TYPES.REFUND_CREATED, userId, {
-          refundId: createdRefund.id,
+      // Record the refund, optional status transition, and audit event atomically.
+      const refund = await this.transactions.recordRefund({
+        paymentId,
+        idempotencyKey,
+        amount,
+        currency: payment.currency,
+        reason: input.reason ?? null,
+        status: providerRefund.status,
+        providerRef: providerRefund.providerRef,
+        nextPaymentStatus: shouldTransition ? nextStatus : null,
+        eventType: PAYMENT_EVENT_TYPES.REFUND_CREATED,
+        eventPayload: {
+          refundId: undefined,
           amount,
           currency: payment.currency,
           reason: input.reason ?? null,
-        });
-
-        return { refund: createdRefund };
+        },
+        actorId: userId,
       });
 
       logger.info({ paymentId: payment.id, refundId: refund.id, amount }, 'Payment refunded');
@@ -275,82 +265,59 @@ export class ChargeService extends BaseService {
   }
 
   /**
-   * Verifies and processes a provider webhook. Signature verification and
-   * idempotent status transitions are performed in a single transaction.
+   * Verifies and processes a provider webhook. Signature verification happens
+   * before any state change and duplicate deliveries are ignored via the unique
+   * provider event id.
    */
-  async handleWebhook(payload: string, signature: string): Promise<WebhookResult> {
+  async handleWebhook(providerName: string, rawBody: string, signature?: string): Promise<WebhookResult> {
     return this.executeWithLogging('payments.webhook', async () => {
-      if (!this.webhookSecret) {
-        throw new ValidationError('Webhook secret is not configured');
+      if (providerName !== this.provider.name && providerName !== 'stripe') {
+        logger.warn({ providerName, failureReason: 'unsupported_provider' }, 'Webhook rejected: unsupported provider');
+        throw new ValidationError(`Unsupported payment provider "${providerName}"`);
       }
 
-      const verified = verifyWebhookSignature(payload, signature, this.webhookSecret, this.webhookToleranceSeconds);
-      if (!verified) {
+      const secret = this.webhookSecret;
+      if (!secret) {
+        throw new AppError('Webhook secret is not configured', 500);
+      }
+      if (!verifyWebhookSignature(rawBody, signature, secret, this.webhookToleranceSeconds)) {
+        logger.warn({ providerName, failureReason: 'invalid_signature' }, 'Webhook rejected: invalid signature');
         throw new UnauthorizedError('Invalid webhook signature');
       }
 
-      const event = JSON.parse(payload) as {
-        id?: string;
-        type?: string;
-        data?: { providerRef?: string; paymentId?: string; amount?: number };
-      };
-
-      const providerRef = event.data?.providerRef;
-      const paymentId = event.data?.paymentId;
-      if (!providerRef && !paymentId) {
-        throw new ValidationError('Webhook payload is missing a payment reference');
+      const event = this.provider.parseWebhookEvent(rawBody);
+      const existingEvent = await this.prisma.paymentEvent.findUnique({ where: { providerEventId: event.id } });
+      if (existingEvent) {
+        return { received: true, duplicate: true };
       }
 
-      const payment = await this.prisma.payment.findFirst({
-        where: paymentId ? { id: paymentId } : { providerRef },
-        include: { refunds: true },
-      });
+      const payment = await this.prisma.payment.findUnique({ where: { providerRef: event.providerRef } });
       if (!payment) {
+        logger.warn({ providerEventId: event.id, providerRef: event.providerRef, failureReason: 'payment_not_found' }, 'Webhook received for unknown payment');
         throw new PaymentNotFoundError('Payment for webhook event not found');
       }
 
-      const nextStatus = transitionForWebhookEvent(event.type ?? '');
-      if (!nextStatus) {
-        return { received: true, processed: false, paymentId: payment.id, status: payment.status as PaymentStatus };
-      }
+      const transition = transitionForWebhookEvent(event.type);
+      const currentStatus = payment.status as PaymentStatus;
+      const nextStatus = transition && canTransition(currentStatus, transition) ? transition : null;
 
-      if (payment.status === nextStatus) {
-        return { received: true, processed: false, paymentId: payment.id, status: payment.status as PaymentStatus };
-      }
-
-      if (!canTransition(payment.status as PaymentStatus, nextStatus)) {
-        logger.warn({ paymentId: payment.id, from: payment.status, to: nextStatus }, 'Webhook status transition rejected');
-        throw new ValidationError(`Invalid payment status transition from "${payment.status}" to "${nextStatus}"`);
-      }
-
-      await this.transactions.runInPaymentTransaction(async (tx) => {
-        await tx.payment.update({ where: { id: payment.id }, data: { status: nextStatus } });
-        await this.recordEventInTransaction(tx, payment.id, PAYMENT_EVENT_TYPES.STATUS_CHANGED, payment.userId, {
-          from: payment.status,
-          to: nextStatus,
-          eventId: event.id ?? null,
-          eventType: event.type ?? null,
-        });
+      await this.transactions.recordWebhookEvent({
+        paymentId: payment.id,
+        providerEventId: event.id,
+        eventType: event.type,
+        payload: event.payload ?? {},
+        nextPaymentStatus: nextStatus,
       });
 
-      return { received: true, processed: true, paymentId: payment.id, status: nextStatus };
+      logger.info({ paymentId: payment.id, providerEventId: event.id, nextStatus }, 'Webhook processed');
+
+      return { received: true, duplicate: false, status: nextStatus ?? currentStatus };
     });
   }
 
-  private async recordEventInTransaction(
-    tx: Prisma.TransactionClient,
-    paymentId: string,
-    type: string,
-    actorId: string,
-    data: Record<string, unknown>
-  ): Promise<void> {
-    await tx.paymentEvent.create({
-      data: {
-        paymentId,
-        type,
-        actorId,
-        data: data as Prisma.InputJsonObject,
-      },
+  private async recordEvent(paymentId: string, type: string, actorId: string, payload: Record<string, unknown>): Promise<void> {
+    await this.prisma.paymentEvent.create({
+      data: { paymentId, type, actorId, payload: payload as Prisma.InputJsonObject },
     });
   }
 
