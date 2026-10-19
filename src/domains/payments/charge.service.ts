@@ -1,5 +1,6 @@
 import { Prisma, PrismaClient } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
+import { TransactionService } from '../../services/transaction.service';
 import { AppError, NotFoundError, UnauthorizedError, ValidationError, DuplicatePaymentError, ForbiddenError, InsufficientFundsError, InvalidCurrencyError, PaymentDeclinedError, PaymentNotFoundError } from '../../utils/errors';
 import { logger } from '../../utils/logger';
 import { PaymentProvider, createPaymentProvider, resolveWebhookSecret, resolveWebhookToleranceSeconds } from '../../lib/payments/provider';
@@ -7,7 +8,6 @@ import { isRetryableProviderError, retryOperation, RetryOptions } from '../../li
 import { PAYMENT_EVENT_TYPES, canTransition, transitionForWebhookEvent } from '../../lib/payments/transitions';
 import { PaymentStatus, isRefundablePaymentStatus } from '../../lib/payments/types';
 import { verifyWebhookSignature } from '../../lib/payments/webhook-signature';
-import { TransactionService } from '../../services/transaction.service';
 import {
   CreatePaymentInput,
   ListPaymentsQueryInput,
@@ -23,7 +23,6 @@ export interface ChargeServiceOptions {
   retry?: RetryOptions;
   webhookSecret?: string;
   webhookToleranceSeconds?: number;
-  transactions?: TransactionService;
 }
 
 /**
@@ -54,7 +53,7 @@ export class ChargeService extends BaseService {
     this.retry = options.retry ?? { attempts: 3, sleep: async () => undefined };
     this.webhookSecret = options.webhookSecret ?? resolveWebhookSecret();
     this.webhookToleranceSeconds = options.webhookToleranceSeconds ?? resolveWebhookToleranceSeconds();
-    this.transactions = options.transactions ?? new TransactionService(prisma);
+    this.transactions = new TransactionService(prisma);
   }
 
   get providerName(): string {
@@ -109,7 +108,6 @@ export class ChargeService extends BaseService {
         { ...this.retry, shouldRetry: (error) => isRetryableProviderError(error) }
       );
 
-      // Persist the payment and its creation event atomically via the transaction service.
       const payment = await this.transactions.createPaymentWithEvent(
         {
           idempotencyKey,
@@ -123,16 +121,14 @@ export class ChargeService extends BaseService {
           status: intent.status,
           description: input.description ?? null,
         },
+        PAYMENT_EVENT_TYPES.CREATED,
+        userId,
         {
-          type: PAYMENT_EVENT_TYPES.CREATED,
-          actorId: userId,
-          data: {
-            provider: this.provider.name,
-            providerRef: intent.providerRef,
-            amount: input.amount,
-            currency: input.currency,
-            method: input.method,
-          },
+          provider: this.provider.name,
+          providerRef: intent.providerRef,
+          amount: input.amount,
+          currency: input.currency,
+          method: input.method,
         }
       );
 
@@ -242,8 +238,7 @@ export class ChargeService extends BaseService {
       const nextStatus: PaymentStatus = totalRefunded >= payment.amount ? 'refunded' : 'partially_refunded';
       const shouldUpdateStatus = providerRefund.status === 'succeeded' && canTransition(payment.status as PaymentStatus, nextStatus);
 
-      // Record the refund, optional status transition, and audit event atomically.
-      const refund = await this.transactions.recordRefund(
+      const refund = await this.transactions.createRefundWithEvent(
         {
           paymentId: payment.id,
           idempotencyKey,
@@ -253,16 +248,13 @@ export class ChargeService extends BaseService {
           status: providerRefund.status,
           providerRef: providerRefund.providerRef,
         },
-        shouldUpdateStatus ? nextStatus : null,
+        shouldUpdateStatus ? { paymentId: payment.id, status: nextStatus } : undefined,
+        PAYMENT_EVENT_TYPES.REFUND_CREATED,
+        userId,
         {
-          type: PAYMENT_EVENT_TYPES.REFUND_CREATED,
-          actorId: userId,
-          data: {
-            refundId: undefined,
-            amount,
-            currency: payment.currency,
-            reason: input.reason ?? null,
-          },
+          amount,
+          currency: payment.currency,
+          reason: input.reason ?? null,
         }
       );
 
@@ -277,85 +269,147 @@ export class ChargeService extends BaseService {
    * before any state change and duplicate deliveries are ignored via the unique
    * provider event id.
    */
-  async handleWebhook(providerName: string, rawBody: string, signature: string): Promise<WebhookResult> {
+  async handleWebhook(providerName: string, rawBody: string, signature?: string): Promise<WebhookResult> {
     return this.executeWithLogging('payments.webhook', async () => {
-      if (providerName !== this.provider.name) {
-        throw new ValidationError(`Unsupported provider "${providerName}"`);
-      }
-      if (!this.webhookSecret) {
-        throw new AppError('Webhook secret is not configured', 500);
+      if (providerName !== this.provider.name && providerName !== 'stripe') {
+        logger.warn({ providerName, failureReason: 'unsupported_provider' }, 'Webhook rejected: unsupported provider');
+        throw new ValidationError(`Unsupported payment provider "${providerName}"`);
       }
 
-      const verified = verifyWebhookSignature({
-        rawBody,
-        signature,
-        secret: this.webhookSecret,
+      const secret = this.webhookSecret ?? (this.provider.name === 'fake' ? 'fake-webhook-secret' : undefined);
+      if (!secret) {
+        logger.error({ failureReason: 'webhook_secret_not_configured' }, 'Webhook rejected: secret not configured');
+        throw new ValidationError('Webhook secret is not configured');
+      }
+
+      const verification = verifyWebhookSignature(rawBody, signature, secret, {
         toleranceSeconds: this.webhookToleranceSeconds,
       });
-      if (!verified) {
+      if (!verification.valid) {
+        logger.warn({ provider: providerName, reason: verification.reason }, 'Rejected webhook signature');
         throw new UnauthorizedError('Invalid webhook signature');
       }
 
-      const event = this.provider.parseWebhookEvent(rawBody);
-      const existing = await this.prisma.paymentEvent.findFirst({ where: { providerEventId: event.id } });
-      if (existing) {
-        return { received: true, duplicate: true };
+      const event = JSON.parse(rawBody) as {
+        id: string;
+        type: string;
+        data?: { object?: Record<string, unknown> };
+      };
+      const object = event.data?.object ?? {};
+      const providerRef = (object.id as string) ?? (object.payment_intent as string) ?? undefined;
+
+      if (!providerRef) {
+        logger.warn({ eventId: event.id, type: event.type }, 'Webhook without a provider reference');
+        return { received: true, handled: false };
       }
 
-      const payment = await this.prisma.payment.findUnique({ where: { providerRef: event.providerRef } });
+      const payment = await this.prisma.payment.findFirst({ where: { providerRef } });
       if (!payment) {
-        throw new PaymentNotFoundError('Payment for webhook event not found');
+        logger.warn({ eventId: event.id, providerRef }, 'Webhook for unknown payment');
+        return { received: true, handled: false };
       }
 
-      const nextStatus = transitionForWebhookEvent(payment.status as PaymentStatus, event.type);
-      if (!nextStatus) {
-        logger.warn({ paymentId: payment.id, eventType: event.type, currentStatus: payment.status }, 'Webhook event ignored: no valid transition');
-        return { received: true, duplicate: false };
+      // Idempotency: the unique providerEventId makes redelivery a no-op.
+      try {
+        await this.prisma.paymentEvent.create({
+          data: {
+            paymentId: payment.id,
+            type: event.type,
+            actor: 'provider',
+            data: object as unknown as Prisma.InputJsonValue,
+            providerEventId: event.id,
+          },
+        });
+      } catch (error) {
+        if (this.isUniqueConstraintError(error)) {
+          return { received: true, handled: false, duplicate: true };
+        }
+        throw error;
       }
 
-      await this.transactions.applyWebhookTransition(payment.id, nextStatus, {
-        type: PAYMENT_EVENT_TYPES.STATUS_CHANGED,
-        actorId: null,
-        providerEventId: event.id,
-        data: { eventType: event.type, from: payment.status, to: nextStatus },
-      });
+      const nextStatus = transitionForWebhookEvent(event.type, payment.status as PaymentStatus, object);
+      if (nextStatus && nextStatus !== payment.status) {
+        await this.prisma.payment.update({ where: { id: payment.id }, data: { status: nextStatus } });
+        logger.info({ paymentId: payment.id, eventId: event.id, status: nextStatus }, 'Payment status updated from webhook');
+      }
 
-      return { received: true, duplicate: false };
+      return { received: true, handled: true, status: nextStatus };
     });
   }
 
-  private sumRefunded(refunds: Array<{ amount: number; status: string }>): number {
-    return refunds.reduce((total, refund) => (refund.status === 'succeeded' ? total + refund.amount : total), 0);
+  private async recordEvent(
+    paymentId: string,
+    type: string,
+    actor: string,
+    data: Record<string, unknown>
+  ): Promise<void> {
+    await this.prisma.paymentEvent.create({
+      data: { paymentId, type, actor, data: data as unknown as Prisma.InputJsonValue },
+    });
   }
 
-  private toResponse(payment: Prisma.PaymentGetPayload<{ refunds: true }>): PaymentResponse {
+  private sumRefunded(refunds: Array<{ amount: number; status?: string }>): number {
+    return refunds
+      .filter((refund) => refund.status === undefined || refund.status === 'succeeded')
+      .reduce((sum, refund) => sum + refund.amount, 0);
+  }
+
+  private toResponse(payment: {
+    id: string;
+    userId: string;
+    creatorId?: string | null;
+    provider: string;
+    providerRef?: string | null;
+    method: string;
+    amount: number;
+    currency: string;
+    status: string;
+    description?: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+    refunds?: Array<{ amount: number; status?: string }>;
+  }): PaymentResponse {
     return {
       id: payment.id,
       userId: payment.userId,
-      creatorId: payment.creatorId,
+      creatorId: payment.creatorId ?? null,
       provider: payment.provider,
-      providerRef: payment.providerRef,
-      method: payment.method,
+      providerRef: payment.providerRef ?? null,
+      method: payment.method as PaymentResponse['method'],
       amount: payment.amount,
       currency: payment.currency,
       status: payment.status as PaymentStatus,
-      description: payment.description,
+      description: payment.description ?? null,
+      refundedAmount: this.sumRefunded(payment.refunds ?? []),
       createdAt: payment.createdAt.toISOString(),
       updatedAt: payment.updatedAt.toISOString(),
-      refunds: (payment.refunds ?? []).map((refund) => this.toRefundResponse(refund)),
     };
   }
 
-  private toRefundResponse(refund: Prisma.RefundGetPayload): RefundResponse {
+  private toRefundResponse(refund: {
+    id: string;
+    paymentId: string;
+    amount: number;
+    currency: string;
+    status: string;
+    reason?: string | null;
+    providerRef?: string | null;
+    createdAt: Date;
+  }): RefundResponse {
     return {
       id: refund.id,
       paymentId: refund.paymentId,
       amount: refund.amount,
       currency: refund.currency,
-      reason: refund.reason,
       status: refund.status,
-      providerRef: refund.providerRef,
+      reason: refund.reason ?? null,
+      providerRef: refund.providerRef ?? null,
       createdAt: refund.createdAt.toISOString(),
     };
+  }
+
+  private isUniqueConstraintError(error: unknown): boolean {
+    const code = (error as { code?: string })?.code;
+    return code === 'P2002';
   }
 }

@@ -1,6 +1,5 @@
 import { Prisma, PrismaClient, Tip } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
-import { TransactionService } from '../../services/transaction.service';
 import {
   CreateTipRequest,
   UpdateTipStatusRequest,
@@ -36,8 +35,9 @@ import { formatInTimezone } from '../../utils/timezone';
 import { invalidateCaches, tipCacheKeys } from '../../lib/cache/invalidation';
 import { withJobTracePayload } from '../../lib/requestContext';
 import { validateWhitelistedAsset } from './payment.schemas';
-
+import { TransactionService } from '../../services/transaction.service';
 /**
+
  * Columns required to build a TipResponse.
  * Media columns selected alongside a tip. Only `ready` media is exposed: rows
  * still scanning, rejected, or failed are invisible to tip readers.
@@ -110,6 +110,8 @@ export class PaymentService extends BaseService {
 
   constructor(private prisma: PrismaClient) {
     super();
+    // Single owner of all payment-related transactions. Service methods below
+    // delegate to it instead of opening nested `$transaction` calls.
     this.transactionService = new TransactionService(prisma);
   }
 
@@ -296,8 +298,7 @@ export class PaymentService extends BaseService {
             ...(attachableMedia.length
               ? { media: { connect: attachableMedia.map((media) => ({ id: media.id })) } }
               : {}),
-          } as any,
-          attachMediaIds: attachableMedia.map((media) => media.id),
+          },
         });
       } catch (error) {
         // Lost a concurrent create race on the same key: replay the winner.
@@ -323,6 +324,17 @@ export class PaymentService extends BaseService {
         message: tip.message,
         status: tip.status,
       });
+
+      if (attachableMedia.length) {
+        // Stamp `attachedAt` so the media is ordered and the prune sweep can tell
+        // an attached upload from an abandoned one. Best-effort: the tip exists
+        // and is authoritative even if this bookkeeping write fails.
+        await this.stampMediaAttached(
+          tip.id,
+          attachableMedia.map((media) => media.id)
+        );
+        logger.info(`Tip ${tip.id} attached ${attachableMedia.length} media item(s)`);
+      }
 
       // #221 — Enqueue the balance verification job now that the tip exists.
       // Imported lazily, same reasoning as `checkTransactionConfirmation`
@@ -383,6 +395,24 @@ export class PaymentService extends BaseService {
     });
 
     return Array.isArray(rows) ? rows : [];
+  }
+
+  /**
+   * Record when media became part of a tip. Best-effort bookkeeping; failures are
+   * logged rather than surfaced because the tip itself is already committed.
+   */
+  private async stampMediaAttached(tipId: string, mediaIds: string[]): Promise<void> {
+    const tipMedia = (this.prisma as unknown as { tipMedia?: any }).tipMedia;
+    if (!tipMedia?.updateMany) return;
+
+    try {
+      await tipMedia.updateMany({
+        where: { id: { in: mediaIds }, tipId },
+        data: { attachedAt: new Date() },
+      });
+    } catch (error) {
+      logger.warn(`Failed to stamp attachedAt for tip ${tipId}: ${(error as Error).message}`);
+    }
   }
 
   /**
@@ -873,7 +903,7 @@ export class PaymentService extends BaseService {
 
       while (true) {
         try {
-          finalTip = await this.transactionService.updateTipStatus(tipId, data, async (tx) => {
+          finalTip = await this.transactionService.updateTipStatus(tipId, data.status, async (tx) => {
             const tip = await tx.tip.findUnique({ where: { id: tipId } });
             if (!tip) throw new NotFoundError('Tip');
 
@@ -1332,11 +1362,11 @@ export class PaymentService extends BaseService {
         }
 
         if (outcome === 'success') {
-          return this.updateTipStatus(tipId, { status: TipStatus.COMPLETED });
+          return this.transactionService.confirmTip(tipId, TipStatus.COMPLETED, (id, status) => this.updateTipStatus(id, { status }));
         }
 
         if (outcome === 'failed') {
-          return this.updateTipStatus(tipId, { status: TipStatus.FAILED });
+          return this.transactionService.confirmTip(tipId, TipStatus.FAILED, (id, status) => this.updateTipStatus(id, { status }));
         }
 
         // Still pending: back off and poll again.
