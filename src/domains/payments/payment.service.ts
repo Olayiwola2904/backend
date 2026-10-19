@@ -1,4 +1,4 @@
-import { Prisma, PrismaClient, Tip } from '@prisma/client';
+import { PrismaClient, Tip } from '@prisma/client';
 import { BaseService } from '../../services/base.service';
 import {
   CreateTipRequest,
@@ -105,13 +105,17 @@ class OptimisticLockError extends Error {
   }
 }
 
+/**
+ * Payment state mutations are routed through `TransactionService` so related
+ * writes (tip status + creator earnings, tip + media attachment) commit
+ * atomically and never nest `$transaction` calls across service layers.
+ */
 export class PaymentService extends BaseService {
+  private readonly transactions: TransactionService;
+
   constructor(private prisma: PrismaClient) {
     super();
-  }
-
-  private get transactions(): TransactionService {
-    return new TransactionService(this.prisma);
+    this.transactions = new TransactionService(prisma);
   }
 
   /**
@@ -295,7 +299,7 @@ export class PaymentService extends BaseService {
             status: TipStatus.PENDING,
             idempotencyKey: data.idempotencyKey ?? null,
             ...(attachableMedia.length
-              ? { media: { connect: attachableMedia.map((media) => ({ id: media.id })) } }
+              ? { mediaIds: attachableMedia.map((media) => media.id) }
               : {}),
           },
         });
@@ -405,7 +409,7 @@ export class PaymentService extends BaseService {
     if (!tipMedia?.updateMany) return;
 
     try {
-      await tipMedia.updateMany({
+      await this.transactions.stampMediaAttached({
         where: { id: { in: mediaIds }, tipId },
         data: { attachedAt: new Date() },
       });
